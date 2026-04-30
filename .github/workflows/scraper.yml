@@ -1,0 +1,51 @@
+name: Scraper Lomba Otomatis
+
+on:
+  schedule:
+    - cron: '0 17 * * *'   # 17:00 UTC = 00:00 WIB
+  workflow_dispatch:         # bisa trigger manual
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: |
+          pip install cloudscraper beautifulsoup4 playwright selenium
+
+      - name: Install Playwright browsers
+        run: playwright install chromium && playwright install-deps
+
+      - name: Install Chrome for Selenium
+        run: |
+          wget -q https://storage.googleapis.com/chrome-for-testing-public/120.0.6099.109/linux64/chrome-linux64.zip
+          wget -q https://storage.googleapis.com/chrome-for-testing-public/120.0.6099.109/linux64/chromedriver-linux64.zip
+          unzip -q chrome-linux64.zip && unzip -q chromedriver-linux64.zip
+          sudo mv chrome-linux64 /opt/chrome
+          sudo mv chromedriver-linux64/chromedriver /usr/bin/chromedriver
+          sudo chmod +x /usr/bin/chromedriver /opt/chrome/chrome
+          sudo apt-get install -y libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
+            libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
+            libgbm1 libasound2 libpango-1.0-0 libnspr4 libnss3
+
+      - name: Run scraper
+        env:
+          IG_SESSION_ID: ${{ secrets.IG_SESSION_ID }}
+        run: python scraper.py
+
+      - name: Commit & push hasil
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add api_collabfinder.json
+          git diff --staged --quiet || git commit -m "🔄 Auto scrape $(date +'%Y-%m-%d %H:%M WIB')"
+          git push
