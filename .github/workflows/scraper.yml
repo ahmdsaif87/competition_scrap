@@ -3,7 +3,7 @@ name: Scraper Lomba Otomatis
 on:
   schedule:
     - cron: '0 17 * * *'   # 17:00 UTC = 00:00 WIB
-  workflow_dispatch:         # bisa trigger manual
+  workflow_dispatch:      
 
 jobs:
   scrape:
@@ -59,5 +59,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add api_collabfinder.json
-          git diff --staged --quiet || git commit -m "🔄 Auto scrape $(date +'%Y-%m-%d %H:%M WIB')"
+          git diff --staged --quiet || git commit -m "Auto scrape $(date +'%Y-%m-%d %H:%M WIB')"
           git push
