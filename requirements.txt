@@ -1,0 +1,5 @@
+cloudscraper==1.2.71
+beautifulsoup4==4.12.3
+playwright==1.42.0
+selenium==4.18.1
+pymongo==4.6.2
