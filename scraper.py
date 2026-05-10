@@ -5,8 +5,8 @@ import asyncio
 import re
 import hashlib
 import json
-import threading
 from urllib.parse import urljoin
+from concurrent.futures import ThreadPoolExecutor
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 from selenium import webdriver
@@ -28,225 +28,163 @@ COLLECTION_NAME = "competition"
 
 try:
     gemini_client = genai.Client()
-except Exception as e:
-    print(f"[WARN] Gagal inisialisasi Gemini Client: {e}")
+except Exception:
     gemini_client = None
 
-# --- SISTEM ANTREAN GEMINI (GLOBAL LOCK) ---
-gemini_lock = threading.Lock()
-last_gemini_call = 0.0
+def proses_batch_dengan_gemini(data_batch):
+    if not gemini_client or not data_batch:
+        return data_batch
 
-def proses_judul_dengan_gemini(judul_mentah, teks_mentah):
-    global last_gemini_call
-    
-    fallback_dict = {"judul": judul_mentah}
+    payload_llm = [{"id": i["id"], "judul_mentah": i["judul"], "timeline_mentah": i["timeline"], "teks_info": i["caption"][:1000]} for i in data_batch]
 
-    if not gemini_client:
-        return fallback_dict
+    prompt = f"""Tugasmu mengekstrak Judul Acara dan Timeline dari array JSON ini.
+1. Perbaiki "judul_mentah" menjadi judul acara yang profesional (buang sapaan/emoji).
+2. Jika "timeline_mentah" KOSONG, cari tanggal dari "teks_info". Jika tidak ada, kosongkan "".
+3. JANGAN ubah "id".
+4. Keluarkan HANYA JSON array: [{{"id": "...", "judul": "...", "timeline": "..."}}]
+Data:
+{json.dumps(payload_llm, ensure_ascii=False)}"""
 
-    prompt = f"""Tugasmu HANYA mengekstrak Judul Acara/Kompetisi dari teks berikut.
-Abaikan "Judul Mentah" jika isinya "Tanpa Judul". Buat judul yang bersih dan profesional tanpa sapaan/emoji.
-Keluarkan HANYA dalam format JSON: {{"judul": "Nama Acara"}}
-
-Judul Mentah: {judul_mentah}
-Teks Asli: {teks_mentah[:1500]}""" # Hanya kirim 1500 karakter awal untuk menghemat waktu AI
-
-    with gemini_lock:
-        waktu_sekarang = time.time()
-        jeda_berlalu = waktu_sekarang - last_gemini_call
-        
-        # Jeda ketat 4.1 detik (aman untuk limit 15 request/menit Gemini Free)
-        if jeda_berlalu < 4.1:
-            time.sleep(4.1 - jeda_berlalu)
-
+    for _ in range(3):
         try:
-            response = gemini_client.models.generate_content(
+            res = gemini_client.models.generate_content(
                 model="gemini-2.0-flash", 
                 contents=prompt,
                 config={"response_mime_type": "application/json"}
             )
-            hasil_llm = json.loads(response.text)
-            last_gemini_call = time.time()
-            return hasil_llm if "judul" in hasil_llm else fallback_dict
             
-        except Exception as e:
-            print(f"  [WARN] Gemini Skip (Limit/Error). Pakai judul mentah.")
-            last_gemini_call = time.time() 
-            return fallback_dict
+            hasil_llm = json.loads(res.text)
+            llm_dict = {str(item.get("id")): item for item in hasil_llm}
+            
+            for item in data_batch:
+                llm_data = llm_dict.get(str(item["id"]), {})
+                item["judul"] = llm_data.get("judul", item["judul"])
+                item["timeline"] = llm_data.get("timeline", item["timeline"])
+            time.sleep(3)
+            return data_batch
+        except Exception:
+            time.sleep(15.0)
 
+    return data_batch
 
-def is_untuk_mahasiswa(teks):
-    teks_lower = str(teks).lower()
-    keywords = ['mahasiswa', 'mahasiswi', 'universitas', 'kampus', 's1', 'd3', 'd4', 'umum', 'undergraduate', 'diploma', 'student', 'university']
-    return any(kw in teks_lower for kw in keywords)
+def is_mahasiswa(teks):
+    return any(kw in str(teks).lower() for kw in ['mahasiswa', 'mahasiswi', 'universitas', 'kampus', 's1', 'd3', 'd4', 'umum', 'undergraduate', 'diploma', 'student', 'university'])
 
-def buat_id_unik(judul, sumber):
-    raw = f"{sumber}_{judul}".lower().strip()
-    return hashlib.md5(raw.encode()).hexdigest()[:12]
+def buat_id(judul, sumber):
+    return hashlib.md5(f"{sumber}_{judul}".lower().strip().encode()).hexdigest()[:12]
 
-def get_existing_ids_from_db(collection):
-    data_lama = collection.find({}, {"id": 1, "_id": 0})
-    return set(item['id'] for item in data_lama if 'id' in item)
-
-def ekstrak_judul_dari_caption(caption):
-    baris_semua = [b.strip() for b in caption.split('\n') if len(b.strip()) > 5]
-    if not baris_semua: return "Tanpa Judul"
-    for baris in baris_semua[:5]:
-        match = re.search(r'\[(.*?)\]', baris)
-        if match and len(match.group(1).strip()) > 5: return match.group(1).strip()
-    keywords = ['kompetisi', 'competition', 'lomba', 'fest', 'championship', 'olympiad', 'olimpiade', 'hackathon', 'call for', 'nasional', 'international']
+def ekstrak_judul_ig(caption):
+    baris = [b.strip() for b in caption.split('\n') if len(b.strip()) > 5]
+    if not baris: return "Tanpa Judul"
+    for b in baris[:5]:
+        m = re.search(r'\[(.*?)\]', b)
+        if m and len(m.group(1).strip()) > 5: return m.group(1).strip()
+    kw = ['kompetisi', 'competition', 'lomba', 'fest', 'championship', 'olympiad', 'olimpiade', 'hackathon', 'call for', 'nasional', 'international']
     gimmicks = ['calling out', 'hello', 'halo', 'are you ready', 'siapkan', 'kabar gembira']
-    for baris in baris_semua[:5]:
-        if any(g in baris.lower() for g in gimmicks): continue
-        if any(kw in baris.lower() for kw in keywords): return baris[:150]
-    for baris in baris_semua[:3]:
-        if not any(g in baris.lower() for g in gimmicks): return baris[:150]
-    return baris_semua[0][:150]
+    for b in baris[:5]:
+        if any(g in b.lower() for g in gimmicks): continue
+        if any(k in b.lower() for k in kw): return b[:150]
+    for b in baris[:3]:
+        if not any(g in b.lower() for g in gimmicks): return b[:150]
+    return baris[0][:150]
 
-def ekstrak_link_pendaftaran(caption):
-    pola = r'(https?://[^\s]+|bit\.ly/[^\s]+|linktr\.ee/[^\s]+|forms\.gle/[^\s]+|s\.id/[^\s]+)'
-    links = re.findall(pola, caption)
-    if links: return [re.sub(r'[).,!]+$', '', l) for l in links]
-    if "bio" in caption.lower(): return ["Link Belum Tersedia"]
-    return []
+def ekstrak_link(caption):
+    links = re.findall(r'(https?://[^\s]+|bit\.ly/[^\s]+|linktr\.ee/[^\s]+|forms\.gle/[^\s]+|s\.id/[^\s]+)', caption)
+    return [re.sub(r'[).,!]+$', '', l) for l in links] if links else (["Link Belum Tersedia"] if "bio" in caption.lower() else [])
 
-# --- PEMBERSIH TEKS HTML (SANDWICH METHOD) ---
-def bersihkan_teks_web(dsoup, pemisah_atas, pemisah_bawah):
-    for tag in dsoup(['nav', 'header', 'footer', 'aside', 'script', 'style']):
-        tag.decompose()
-    teks_kotor = dsoup.get_text(separator='\n')
-    if pemisah_atas in teks_kotor and pemisah_bawah in teks_kotor:
-        teks_bersih = teks_kotor.split(pemisah_atas)[-1].split(pemisah_bawah)[0]
-    elif pemisah_atas in teks_kotor:
-        teks_bersih = teks_kotor.split(pemisah_atas)[-1]
-    else:
-        teks_bersih = teks_kotor
-    return re.sub(r'\n\s*\n', '\n', teks_bersih).strip()
+def potong_html(dsoup, top, bot):
+    for tag in dsoup(['nav', 'header', 'footer', 'aside', 'script', 'style']): tag.decompose()
+    teks = dsoup.get_text(separator='\n')
+    if top in teks and bot in teks: teks = teks.split(top)[-1].split(bot)[0]
+    elif top in teks: teks = teks.split(top)[-1]
+    return re.sub(r'\n\s*\n', '\n', teks).strip()
 
+def ambil_detail_infolomba(link, a, id_sudah_ada, base_url, scraper):
+    try:
+        res = scraper.get(link, headers=HEADERS)
+        if res.status_code != 200: return None
+        dsoup = BeautifulSoup(res.text, 'html.parser')
+        teks_konten = potong_html(dsoup, "Daftar Sekarang", "Laporkan Lomba")
+        if not is_mahasiswa(teks_konten): return None
+
+        judul_mentah = '-'.join(link.rstrip('/').split('/')[-1].replace('info-', '', 1).split('-')[:-1]).replace('-', ' ').title()
+        uid = buat_id(judul_mentah, "infolomba.id")
+        if uid in id_sudah_ada: return None
+
+        poster_url = (a.find('img') or {}).get('src') or (a.find('img') or {}).get('data-src')
+        if not poster_url:
+            wadah = a.find_parent('div')
+            poster_url = ((wadah.find_parent('div') or wadah).find('img') or {}).get('src') if wadah else ""
+        if poster_url and not poster_url.startswith('http'): poster_url = urljoin(base_url, poster_url)
+        if not poster_url: poster_url = next((urljoin(base_url, img.get('src') or '') for img in dsoup.find_all('img') if '/poster/' in (img.get('src') or '')), '')
+
+        dsoup_ori = BeautifulSoup(res.text, 'html.parser') 
+        btn = dsoup_ori.find(lambda t: t.name == 'a' and t.text and 'Daftar Sekarang' in t.text)
+        link_pendaftaran = [btn['href']] if btn and btn.get('href') and btn['href'] not in ['#', ''] and not btn['href'].startswith('javascript') else []
+
+        timeline = next((li.get_text(strip=True).replace('📅', '').replace('🗓', '').strip() for li in dsoup_ori.find_all(['li', 'div', 'p']) if ('📅' in li.text or '🗓' in li.text or re.search(r'\d{1,2}\s+[A-Za-z]+\s*-\s*\d{1,2}\s+[A-Za-z]+', li.text)) and len(li.get_text(strip=True)) < 50 and any(c.isdigit() for c in li.get_text(strip=True))), "")
+        
+        return {"id": uid, "sumber": "infolomba.id", "judul": judul_mentah, "poster": poster_url, "caption": teks_konten, "link_pendaftaran": link_pendaftaran, "timeline": timeline, "link_direct": link}
+    except Exception: return None
 
 def scrape_infolomba(id_sudah_ada):
-    print("[INFO] Mulai infolomba.id...")
     base_url = "https://infolomba.id"
     scraper = cloudscraper.create_scraper()
-    hasil = []
     try:
         soup = BeautifulSoup(scraper.get(base_url, headers=HEADERS).text, 'html.parser')
-        links_unik = list({urljoin(base_url, a.get('href', '')): a for a in soup.find_all('a', href=lambda h: h and 'info-' in h) if urljoin(base_url, a.get('href', '')).startswith(base_url + '/')}.items())
+        links_unik = list({urljoin(base_url, a.get('href', '')): a for a in soup.find_all('a', href=lambda h: h and 'info-' in h) if urljoin(base_url, a.get('href', '')).startswith(base_url + '/')}.items())[:15]
+        
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            hasil = list(filter(None, executor.map(lambda item: ambil_detail_infolomba(item[0], item[1], id_sudah_ada, base_url, scraper), links_unik)))
+        return hasil
+    except Exception: return []
 
-        for link, a in links_unik[:15]:
-            try:
-                res = scraper.get(link, headers=HEADERS)
-                if res.status_code != 200: continue
-                dsoup = BeautifulSoup(res.text, 'html.parser')
-                teks_konten = bersihkan_teks_web(dsoup, "Daftar Sekarang", "Laporkan Lomba")
-                
-                if not is_untuk_mahasiswa(teks_konten): continue
+async def ambil_detail_silomba(card, browser, id_sudah_ada, base_url, semaphore):
+    async with semaphore:
+        judul_mentah = card.get('aria-label', '').replace('Lihat detail kompetisi ', '').strip() or (card.find(['h2', 'h3', 'h4']).text.strip() if card.find(['h2', 'h3', 'h4']) else "Tanpa judul")
+        uid = buat_id(judul_mentah, "silomba.id")
+        if uid in id_sudah_ada: return None
 
-                judul_mentah = '-'.join(link.rstrip('/').split('/')[-1].replace('info-', '', 1).split('-')[:-1]).replace('-', ' ').title()
-                uid = buat_id_unik(judul_mentah, "infolomba.id")
-                if uid in id_sudah_ada: continue
+        link_detail = urljoin(base_url, card['href'])
+        dp = await browser.new_page()
+        try:
+            await dp.goto(link_detail, wait_until="domcontentloaded", timeout=30000)
+            dsoup_ori = BeautifulSoup(await dp.content(), 'html.parser')
+            teks_konten = potong_html(BeautifulSoup(await dp.content(), 'html.parser'), "Deskripsi Lomba", "Persyaratan Pendaftaran")
+            if not is_mahasiswa(teks_konten): return None
 
-                poster_url = (a.find('img') or {}).get('src') or (a.find('img') or {}).get('data-src')
-                if not poster_url:
-                    wadah = a.find_parent('div')
-                    img_card = (wadah.find_parent('div') or wadah).find('img') if wadah else None
-                    poster_url = (img_card or {}).get('src') or (img_card or {}).get('data-src', '')
-                if poster_url and not poster_url.startswith('http'): poster_url = urljoin(base_url, poster_url)
-                if not poster_url:
-                    poster_url = next((urljoin(base_url, img.get('src') or img.get('data-src', '')) for img in dsoup.find_all('img') if '/poster/' in (img.get('src') or img.get('data-src', ''))), '')
-
-                dsoup_ori = BeautifulSoup(res.text, 'html.parser') 
-                btn = dsoup_ori.find(lambda t: t.name == 'a' and t.text and 'Daftar Sekarang' in t.text)
-                link_pendaftaran = [btn['href']] if btn and btn.get('href') and btn['href'] not in ['#', ''] and not btn['href'].startswith('javascript') else []
-
-                # LLM HANYA memproses judul
-                item_llm = proses_judul_dengan_gemini(judul_mentah, teks_konten)
-                judul_final = item_llm.get("judul", judul_mentah)
-
-                hasil.append({
-                    "id": uid, 
-                    "sumber": "infolomba.id", 
-                    "judul": judul_final, 
-                    "poster": poster_url, 
-                    "caption": teks_konten, 
-                    "link_pendaftaran": link_pendaftaran, 
-                    "timeline": "",
-                    "link_direct": link
-                })
-                id_sudah_ada.add(uid)
-                print(f"  [OK] {judul_final[:50]}")
-            except Exception: pass
-    except Exception as e: print(f"[ERROR] Error Infolomba: {e}")
-    print(f"[INFO] Selesai infolomba.id: {len(hasil)} data baru")
-    return hasil
+            poster = (dsoup_ori.find('img', src=lambda s: s and 'original-poster' in s) or dsoup_ori.find('img', src=lambda s: s and 'storage2.silomba.id' in s) or {}).get('src', '')
+            link_pendaftaran = list(set([btn.get('href') for btn in dsoup_ori.find_all(lambda t: t.name == 'a' and t.text and any(x in t.text for x in ['Daftar', 'Website Resmi', 'Register'])) if btn.get('href') and btn.get('href') != '#' and not btn.get('href').startswith('javascript')]))
+            timeline = next((p.get_text(separator=" ").strip() for p in dsoup_ori.find_all(['p', 'span', 'li']) if any(x in p.text for x in ['Batas Pengumpulan', 'Pendaftaran', 'Pelaksanaan']) and re.search(r'\d{1,2}\s+[A-Za-z]+\s+\d{4}', p.text)), "")
+            
+            return {"id": uid, "sumber": "silomba.id", "judul": judul_mentah, "poster": poster, "caption": teks_konten, "link_pendaftaran": link_pendaftaran, "timeline": timeline, "link_direct": link_detail}
+        except Exception: return None
+        finally: await dp.close()
 
 async def scrape_silomba(id_sudah_ada):
-    print("[INFO] Mulai silomba.id...")
     base_url = "https://silomba.id"
-    hasil = []
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
         try:
+            page = await browser.new_page()
             await page.goto(base_url, wait_until="domcontentloaded", timeout=60000)
             await page.wait_for_selector("#competition-section", timeout=15000)
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await page.wait_for_timeout(2000)
             soup = BeautifulSoup(await page.content(), 'html.parser')
-            section = soup.find(id='competition-section')
-            if not section: return hasil
-
-            cards = section.find_all('a', href=lambda h: h and h.startswith('/lomba/'))
+            await page.close()
             
-            # MEMAKAI 1 TAB SAJA UNTUK SEMUA DETAIL AGAR TIDAK CRASH/TIMEOUT
-            dp = await browser.new_page()
-            for card in cards:
-                judul_mentah = card.get('aria-label', '').replace('Lihat detail kompetisi ', '').strip() or (card.find(['h2', 'h3', 'h4']).text.strip() if card.find(['h2', 'h3', 'h4']) else "Tanpa judul")
-                uid = buat_id_unik(judul_mentah, "silomba.id")
-                if uid in id_sudah_ada: continue
-
-                link_detail = urljoin(base_url, card['href'])
-                try:
-                    await dp.goto(link_detail, wait_until="domcontentloaded", timeout=30000)
-                    dsoup = BeautifulSoup(await dp.content(), 'html.parser')
-                    
-                    teks_konten = bersihkan_teks_web(dsoup, "Deskripsi Lomba", "Persyaratan Pendaftaran")
-                    if not is_untuk_mahasiswa(teks_konten): continue
-
-                    dsoup_ori = BeautifulSoup(await dp.content(), 'html.parser')
-                    poster = (dsoup_ori.find('img', src=lambda s: s and 'original-poster' in s) or dsoup_ori.find('img', src=lambda s: s and 'storage2.silomba.id' in s) or {}).get('src', '')
-                    link_pendaftaran = list(set([btn.get('href') for btn in dsoup_ori.find_all(lambda t: t.name == 'a' and t.text and any(x in t.text for x in ['Daftar', 'Website Resmi', 'Register'])) if btn.get('href') and btn.get('href') != '#' and not btn.get('href').startswith('javascript')]))
-                    
-                    # LLM HANYA memproses judul (Thread-safe)
-                    item_llm = await asyncio.to_thread(proses_judul_dengan_gemini, judul_mentah, teks_konten)
-                    judul_final = item_llm.get("judul", judul_mentah)
-
-                    hasil.append({
-                        "id": uid, 
-                        "sumber": "silomba.id", 
-                        "judul": judul_final, 
-                        "poster": poster, 
-                        "caption": teks_konten, 
-                        "link_pendaftaran": link_pendaftaran, 
-                        "timeline": "",
-                        "link_direct": link_detail
-                    })
-                    id_sudah_ada.add(uid)
-                    print(f"  [OK] {judul_final[:50]}")
-                except Exception: pass
-            await dp.close()
-        except Exception as e: print(f"[ERROR] Error Silomba: {e}")
+            cards = soup.find(id='competition-section').find_all('a', href=lambda h: h and h.startswith('/lomba/')) if soup.find(id='competition-section') else []
+            
+            sem = asyncio.Semaphore(4)
+            tasks = [ambil_detail_silomba(card, browser, id_sudah_ada, base_url, sem) for card in cards]
+            return list(filter(None, await asyncio.gather(*tasks)))
+        except Exception: return []
         finally: await browser.close()
-    print(f"[INFO] Selesai silomba.id: {len(hasil)} data baru")
-    return hasil
 
 def scrape_instagram(id_sudah_ada):
-    if not IG_SESSION_ID:
-        print("[WARN] IG_SESSION_ID tidak diset")
-        return []
-    print("[INFO] Mulai Instagram...")
-    hasil = []
-    opts = Options()
+    if not IG_SESSION_ID: return []
+    hasil, opts = [], Options()
     for arg in ["--headless=new", "--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage", f"user-agent={HEADERS['User-Agent']}"]: opts.add_argument(arg)
     opts.binary_location = "/opt/chrome/chrome"
     driver = webdriver.Chrome(service=Service(executable_path="/usr/bin/chromedriver"), options=opts)
@@ -260,12 +198,12 @@ def scrape_instagram(id_sudah_ada):
         if "login" in driver.current_url: return []
 
         for akun in ['infolomba', 'infolomba_gratis', 'infolomba.olimpiade']:
-            url_posts = []
             driver.get(f"https://www.instagram.com/{akun}/")
             time.sleep(random.randint(4, 6))
             if "Page Not Found" in driver.title: continue
 
             last_h = driver.execute_script("return document.body.scrollHeight")
+            url_posts = []
             for _ in range(3):
                 driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
                 time.sleep(random.randint(2, 4))
@@ -281,61 +219,27 @@ def scrape_instagram(id_sudah_ada):
                     except: pass
                     time.sleep(random.randint(3, 5))
 
-                    caption = ""
                     try: caption = driver.find_element(By.XPATH, '//h1').text
-                    except:
-                        try:
-                            m = driver.find_element(By.XPATH, '//meta[@property="og:description"]').get_attribute('content')
-                            caption = m.split(": ", 1)[1].strip('"') if ": " in m else m
-                        except: caption = driver.title
+                    except: caption = driver.find_element(By.XPATH, '//meta[@property="og:description"]').get_attribute('content').split(": ", 1)[-1].strip('"')
 
-                    if not caption or not is_untuk_mahasiswa(caption): continue
+                    if not caption or not is_mahasiswa(caption): continue
 
-                    judul_mentah = ekstrak_judul_dari_caption(caption)
-                    uid = buat_id_unik(judul_mentah, f"IG @{akun}")
+                    judul_mentah = ekstrak_judul_ig(caption)
+                    uid = buat_id(judul_mentah, f"IG @{akun}")
                     if uid in id_sudah_ada: continue
 
-                    poster = driver.execute_script("""
-                        var imgs = document.querySelectorAll('img');
-                        for (var i = 0; i < imgs.length; i++) {
-                            var src = imgs[i].src || '';
-                            if ((imgs[i].alt || '').toLowerCase().includes('profile') || src.includes('150x150')) continue;
-                            if (src.includes('scontent') || src.includes('cdninstagram')) {
-                                var s = imgs[i].srcset; return s ? s.split(',').pop().trim().split(' ')[0] : src;
-                            }
-                        } return '';
-                    """) or (driver.find_element(By.XPATH, '//meta[@property="og:image"]').get_attribute('content') if driver.find_elements(By.XPATH, '//meta[@property="og:image"]') else "")
-
-                    links_mentah = ekstrak_link_pendaftaran(caption)
-
-                    # LLM HANYA memproses judul
-                    item_llm = proses_judul_dengan_gemini(judul_mentah, caption)
-                    judul_final = item_llm.get("judul", judul_mentah)
-
-                    hasil.append({
-                        "id": uid, 
-                        "sumber": f"IG @{akun}", 
-                        "judul": judul_final, 
-                        "poster": poster, 
-                        "caption": caption,
-                        "link_pendaftaran": links_mentah, 
-                        "timeline": "",
-                        "link_direct": url
-                    })
+                    poster = driver.execute_script("var i=document.querySelectorAll('img');for(var j=0;j<i.length;j++){var s=i[j].src||'';if(!(i[j].alt||'').toLowerCase().includes('profile')&&!s.includes('150x150')&&(s.includes('scontent')||s.includes('cdninstagram'))){return i[j].srcset?i[j].srcset.split(',').pop().trim().split(' ')[0]:s;}}return '';") or driver.find_element(By.XPATH, '//meta[@property="og:image"]').get_attribute('content')
+                    
+                    hasil.append({"id": uid, "sumber": f"IG @{akun}", "judul": judul_mentah, "poster": poster, "caption": caption, "link_pendaftaran": ekstrak_link(caption), "timeline": "", "link_direct": url})
                     id_sudah_ada.add(uid)
-                    print(f"  [OK] {judul_final[:50]}")
                 except Exception: pass
-    except Exception as e: print(f"[ERROR] Error IG: {e}")
     finally: driver.quit()
-    print(f"[INFO] Selesai Instagram: {len(hasil)} data baru")
     return hasil
 
 async def main():
-    print("[INFO] Menghubungkan ke MongoDB...")
     client = pymongo.MongoClient(MONGO_URI)
     collection = client[DB_NAME][COLLECTION_NAME]
-    
-    id_sudah_ada = get_existing_ids_from_db(collection)
+    id_sudah_ada = set(i['id'] for i in collection.find({}, {"id": 1, "_id": 0}) if 'id' in i)
 
     results = await asyncio.gather(
         asyncio.to_thread(scrape_infolomba, id_sudah_ada),
@@ -343,14 +247,13 @@ async def main():
         asyncio.to_thread(scrape_instagram, id_sudah_ada)
     )
 
-    hasil_baru = [item for res in results if isinstance(res, list) for item in res]
-    print(f"\n[INFO] Mendapatkan total {len(hasil_baru)} data baru.")
+    hasil_baru = [i for r in results if isinstance(r, list) for i in r]
 
     if hasil_baru:
-        result = collection.bulk_write([UpdateOne({'id': item['id']}, {'$set': item}, upsert=True) for item in hasil_baru])
-        print(f"[INFO] Disimpan ke MongoDB: {result.upserted_count} baru, {result.modified_count} update.")
-    else:
-        print("[INFO] Tidak ada data baru untuk disimpan.")
+        hasil_final = []
+        for i in range(0, len(hasil_baru), 15):
+            hasil_final.extend(proses_batch_dengan_gemini(hasil_baru[i:i + 15]))
+        collection.bulk_write([UpdateOne({'id': i['id']}, {'$set': i}, upsert=True) for i in hasil_final])
 
     client.close()
 
