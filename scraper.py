@@ -51,14 +51,19 @@ def ekstrak_link(teks: str) -> list[str]:
     return [re.sub(r'[).,!]+$', '', l) for l in links]
 
 
-def potong_html(dsoup: BeautifulSoup, top: str, bot: str) -> str:
+def potong_html(dsoup: BeautifulSoup, hapus_setelah: str | None = None, hapus_mulai: str | None = None) -> str:
+    """
+    Ambil teks bersih dari halaman.
+    - hapus_mulai  : buang semua teks SEBELUM marker ini (opsional)
+    - hapus_setelah: buang semua teks SETELAH marker ini (opsional)
+    """
     for tag in dsoup(['nav', 'header', 'footer', 'aside', 'script', 'style']):
         tag.decompose()
     teks = dsoup.get_text(separator='\n')
-    if top in teks and bot in teks:
-        teks = teks.split(top)[-1].split(bot)[0]
-    elif top in teks:
-        teks = teks.split(top)[-1]
+    if hapus_mulai and hapus_mulai in teks:
+        teks = teks.split(hapus_mulai, 1)[0]        # buang dari marker ke bawah
+    if hapus_setelah and hapus_setelah in teks:
+        teks = teks.split(hapus_setelah, 1)[-1]     # ambil dari marker ke bawah
     return re.sub(r'\n\s*\n', '\n', teks).strip()
 
 
@@ -96,33 +101,49 @@ def proses_batch_dengan_gemini(data_batch: list[dict]) -> list[dict]:
     if not gemini_client or not data_batch:
         return data_batch
 
-    # Payload sekecil mungkin — caption dipotong hanya jika sangat panjang
-    payload_llm = [
-        {
+    # Payload seminimal mungkin.
+    # - infolomba/silomba: kirim caption penuh (sudah bersih dari scraper)
+    # - IG: kirim caption + judul_kasar sebagai petunjuk awal saja
+    payload_llm = []
+    for item in data_batch:
+        entry: dict = {
             "id": item["id"],
             "sumber": item["sumber"],
-            "judul_kasar": item["judul"],
-            # Caption IG biasanya pendek; infolomba/silomba bisa panjang → trim 1500 char
-            "caption": item["caption"][:1500],
+            # Caption di-trim 2000 char — cukup untuk judul + timeline
+            "caption": item["caption"][:2000],
         }
-        for item in data_batch
-    ]
+        # Untuk IG, sertakan judul_kasar sebagai konteks awal (LLM tetap harus cari dari caption)
+        if "IG" in item["sumber"]:
+            entry["judul_kasar"] = item["judul"]
+        payload_llm.append(entry)
 
-    prompt = f"""Kamu adalah AI Data Extractor untuk lomba/kompetisi. Proses JSON Array berikut.
+    prompt = f"""Kamu adalah AI Data Extractor untuk info lomba/kompetisi. Proses setiap item dalam JSON Array berikut.
 
-ATURAN:
-1. "judul": Nama resmi acara/kompetisi dari "caption". Hapus emoji, simbol markdown (*, _), sapaan ("Hi!", "Telah dibuka", dll). Jika tidak ditemukan, perbaiki "judul_kasar".
-2. "timeline": Cari jadwal pendaftaran/pelaksanaan dari "caption". Hapus emoji. Jika tidak ada, kembalikan "".
-3. "link_pendaftaran":
-   - Jika "sumber" mengandung "IG": ekstrak SEMUA URL pendaftaran dari "caption" → array of strings.
-   - Jika "sumber" BUKAN IG: kembalikan array kosong [] (link sudah di-scrape, tidak perlu diproses).
+TUGAS PER FIELD:
+
+1. "judul"
+   - Temukan nama resmi acara/kompetisi dari field "caption".
+   - Hapus semua: emoji, simbol markdown (* _ # >), kata sapaan ("Hai!", "Halo sobat", "Telah dibuka", "Yuk daftar", dll).
+   - Hasil akhir harus berupa nama lomba/kompetisi yang bersih dan singkat.
+   - Untuk sumber IG: "judul_kasar" hanyalah petunjuk awal — WAJIB cari nama resmi dari "caption", jangan pakai judul_kasar mentah jika caption mengandung nama lebih lengkap/resmi.
+
+2. "timeline"
+   - Cari info jadwal dari "caption": tanggal pendaftaran, pelaksanaan, pengumuman, dll.
+   - Hapus emoji dari hasil. Format bebas, pertahankan info tanggal aslinya.
+   - Jika tidak ada informasi jadwal sama sekali, kembalikan "".
+   - PENTING: Setiap item WAJIB dicari timelinenya dari captionnya MASING-MASING. Jangan copy timeline dari item lain.
+
+3. "link_pendaftaran"
+   - Jika "sumber" mengandung kata "IG": ekstrak SEMUA URL yang ada di "caption" → array of strings. Jika tidak ada, kembalikan [].
+   - Jika "sumber" TIDAK mengandung "IG": kembalikan [] (link sudah di-scrape terpisah).
+
 4. Jangan ubah nilai "id".
-5. Output: HANYA JSON Array valid. Tanpa markdown, tanpa penjelasan.
+5. Output: HANYA JSON Array valid. Tanpa markdown code block, tanpa teks penjelasan apapun.
 
-Format setiap item output:
+Format output setiap item (wajib ada semua field):
 {{"id": "...", "judul": "...", "timeline": "...", "link_pendaftaran": []}}
 
-Data:
+Data yang harus diproses:
 {json.dumps(payload_llm, ensure_ascii=False)}"""
 
     for attempt in range(3):
@@ -169,7 +190,9 @@ def _ambil_detail_infolomba(link: str, anchor, id_sudah_ada: set, base_url: str,
             return None
 
         dsoup = BeautifulSoup(res.text, 'html.parser')
-        caption = potong_html(dsoup, "Daftar Sekarang", "Laporkan Lomba")
+        # Ambil dari awal halaman, buang footer mulai "Laporkan Lomba"
+        # agar judul resmi & timeline di bagian atas halaman tetap masuk caption
+        caption = potong_html(dsoup, hapus_mulai="Laporkan Lomba")
 
         if not is_mahasiswa(caption):
             return None
@@ -215,28 +238,14 @@ def _ambil_detail_infolomba(link: str, anchor, id_sudah_ada: set, base_url: str,
             else []
         )
 
-        # --- Timeline kasar (LLM akan perbaiki/lengkapi) ---
-        timeline_kasar = next(
-            (
-                li.get_text(strip=True).replace('📅', '').replace('🗓', '').strip()
-                for li in dsoup.find_all(['li', 'div', 'p'])
-                if (
-                    ('📅' in li.text or '🗓' in li.text or re.search(r'\d{1,2}\s+[A-Za-z]+\s*-\s*\d{1,2}\s+[A-Za-z]+', li.text))
-                    and len(li.get_text(strip=True)) < 50
-                    and any(c.isdigit() for c in li.get_text(strip=True))
-                )
-            ),
-            "",
-        )
-
         return {
             "id": uid,
             "sumber": "infolomba.id",
-            "judul": judul_kasar,           # LLM perbaiki
+            "judul": judul_kasar,
             "poster": poster_url,
             "caption": caption,
-            "link_pendaftaran": link_pendaftaran,  # sudah di-scrape
-            "timeline": timeline_kasar,     # LLM lengkapi
+            "link_pendaftaran": link_pendaftaran,
+            "timeline": "",          # diisi LLM dari caption
             "link_direct": link,
         }
     except Exception:
@@ -284,7 +293,9 @@ async def _ambil_detail_silomba(card, browser, id_sudah_ada: set, base_url: str,
         try:
             await page.goto(link_detail, wait_until="domcontentloaded", timeout=30000)
             dsoup = BeautifulSoup(await page.content(), 'html.parser')
-            caption = potong_html(dsoup, "Deskripsi Lomba", "Persyaratan Pendaftaran")
+            # Ambil seluruh konten halaman, buang hanya footer mulai "Bagikan Lomba"
+            # agar timeline yang ada di luar section deskripsi tetap masuk caption
+            caption = potong_html(dsoup, hapus_mulai="Bagikan Lomba")
 
             if not is_mahasiswa(caption):
                 return None
@@ -306,25 +317,14 @@ async def _ambil_detail_silomba(card, browser, id_sudah_ada: set, base_url: str,
                 if btn.get('href') and btn.get('href') != '#' and not btn.get('href').startswith('javascript')
             ))
 
-            # --- Timeline kasar (LLM akan perbaiki) ---
-            timeline_kasar = next(
-                (
-                    p.get_text(separator=" ").strip()
-                    for p in dsoup.find_all(['p', 'span', 'li'])
-                    if any(x in p.text for x in ['Batas Pengumpulan', 'Pendaftaran', 'Pelaksanaan'])
-                    and re.search(r'\d{1,2}\s+[A-Za-z]+\s+\d{4}', p.text)
-                ),
-                "",
-            )
-
             return {
                 "id": uid,
                 "sumber": "silomba.id",
-                "judul": judul_kasar,              # LLM perbaiki
+                "judul": judul_kasar,
                 "poster": poster,
                 "caption": caption,
-                "link_pendaftaran": link_pendaftaran,  # sudah di-scrape
-                "timeline": timeline_kasar,        # LLM lengkapi
+                "link_pendaftaran": link_pendaftaran,
+                "timeline": "",          # diisi LLM dari caption
                 "link_direct": link_detail,
             }
         except Exception:
