@@ -79,7 +79,7 @@ def proses_teks_dengan_groq(teks_mentah, judul_fallback):
                     "content": prompt,
                 }
             ],
-            model="llama3-8b-8192",
+            model="qwen-2.5-32b",
             temperature=0.3,
             response_format={"type": "json_object"}
         )
