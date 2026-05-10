@@ -2,7 +2,6 @@ import os
 import time
 import random
 import asyncio
-import re
 import hashlib
 import json
 from urllib.parse import urljoin
@@ -35,14 +34,24 @@ def proses_batch_dengan_gemini(data_batch):
     if not gemini_client or not data_batch:
         return data_batch
 
-    payload_llm = [{"id": i["id"], "judul_mentah": i["judul"], "timeline_mentah": i["timeline"], "teks_info": i["caption"][:1000]} for i in data_batch]
+    payload_llm = []
+    for i in data_batch:
+        payload_llm.append({
+            "id": i["id"],
+            "sumber": i["sumber"],
+            "teks": i["caption"][:1200],
+            "link_web": i["link_pendaftaran"]
+        })
 
-    prompt = f"""Tugasmu mengekstrak Judul Acara dan Timeline dari array JSON ini.
-1. Perbaiki "judul_mentah" menjadi judul acara yang profesional (buang sapaan/emoji).
-2. Jika "timeline_mentah" KOSONG, cari tanggal dari "teks_info". Jika tidak ada, kosongkan "".
-3. JANGAN ubah "id".
-4. Keluarkan HANYA JSON array: [{{"id": "...", "judul": "...", "timeline": "..."}}]
-Data:
+    prompt = f"""Ekstrak informasi menjadi array JSON berdasarkan data mentah.
+ATURAN:
+1. "judul": Ekstrak judul lomba/acara yang bersih dari "teks". Jangan gunakan sapaan.
+2. "timeline": Ekstrak informasi jadwal/tanggal pelaksanaan/pendaftaran dari "teks". Jika tidak ada, kembalikan string kosong "".
+3. "link_pendaftaran": Jika "sumber" berisi teks "IG", ekstrak URL (seperti bit.ly, forms.gle, dsb) dari dalam "teks" menjadi array. Jika bukan IG, gunakan isi dari "link_web" persis seperti aslinya.
+4. JANGAN ubah nilai "id".
+5. Format keluaran wajib JSON Array murni: [{{"id": "...", "judul": "...", "timeline": "...", "link_pendaftaran": ["..."]}}]
+
+Data Mentah:
 {json.dumps(payload_llm, ensure_ascii=False)}"""
 
     for _ in range(3):
@@ -59,7 +68,8 @@ Data:
             for item in data_batch:
                 llm_data = llm_dict.get(str(item["id"]), {})
                 item["judul"] = llm_data.get("judul", item["judul"])
-                item["timeline"] = llm_data.get("timeline", item["timeline"])
+                item["timeline"] = llm_data.get("timeline", "")
+                item["link_pendaftaran"] = llm_data.get("link_pendaftaran", item["link_pendaftaran"])
             time.sleep(3)
             return data_batch
         except Exception:
@@ -72,25 +82,6 @@ def is_mahasiswa(teks):
 
 def buat_id(judul, sumber):
     return hashlib.md5(f"{sumber}_{judul}".lower().strip().encode()).hexdigest()[:12]
-
-def ekstrak_judul_ig(caption):
-    baris = [b.strip() for b in caption.split('\n') if len(b.strip()) > 5]
-    if not baris: return "Tanpa Judul"
-    for b in baris[:5]:
-        m = re.search(r'\[(.*?)\]', b)
-        if m and len(m.group(1).strip()) > 5: return m.group(1).strip()
-    kw = ['kompetisi', 'competition', 'lomba', 'fest', 'championship', 'olympiad', 'olimpiade', 'hackathon', 'call for', 'nasional', 'international']
-    gimmicks = ['calling out', 'hello', 'halo', 'are you ready', 'siapkan', 'kabar gembira']
-    for b in baris[:5]:
-        if any(g in b.lower() for g in gimmicks): continue
-        if any(k in b.lower() for k in kw): return b[:150]
-    for b in baris[:3]:
-        if not any(g in b.lower() for g in gimmicks): return b[:150]
-    return baris[0][:150]
-
-def ekstrak_link(caption):
-    links = re.findall(r'(https?://[^\s]+|bit\.ly/[^\s]+|linktr\.ee/[^\s]+|forms\.gle/[^\s]+|s\.id/[^\s]+)', caption)
-    return [re.sub(r'[).,!]+$', '', l) for l in links] if links else (["Link Belum Tersedia"] if "bio" in caption.lower() else [])
 
 def potong_html(dsoup, top, bot):
     for tag in dsoup(['nav', 'header', 'footer', 'aside', 'script', 'style']): tag.decompose()
@@ -107,8 +98,8 @@ def ambil_detail_infolomba(link, a, id_sudah_ada, base_url, scraper):
         teks_konten = potong_html(dsoup, "Daftar Sekarang", "Laporkan Lomba")
         if not is_mahasiswa(teks_konten): return None
 
-        judul_mentah = '-'.join(link.rstrip('/').split('/')[-1].replace('info-', '', 1).split('-')[:-1]).replace('-', ' ').title()
-        uid = buat_id(judul_mentah, "infolomba.id")
+        judul_sementara = '-'.join(link.rstrip('/').split('/')[-1].replace('info-', '', 1).split('-')[:-1]).replace('-', ' ').title()
+        uid = buat_id(judul_sementara, "infolomba.id")
         if uid in id_sudah_ada: return None
 
         poster_url = (a.find('img') or {}).get('src') or (a.find('img') or {}).get('data-src')
@@ -122,9 +113,7 @@ def ambil_detail_infolomba(link, a, id_sudah_ada, base_url, scraper):
         btn = dsoup_ori.find(lambda t: t.name == 'a' and t.text and 'Daftar Sekarang' in t.text)
         link_pendaftaran = [btn['href']] if btn and btn.get('href') and btn['href'] not in ['#', ''] and not btn['href'].startswith('javascript') else []
 
-        timeline = next((li.get_text(strip=True).replace('📅', '').replace('🗓', '').strip() for li in dsoup_ori.find_all(['li', 'div', 'p']) if ('📅' in li.text or '🗓' in li.text or re.search(r'\d{1,2}\s+[A-Za-z]+\s*-\s*\d{1,2}\s+[A-Za-z]+', li.text)) and len(li.get_text(strip=True)) < 50 and any(c.isdigit() for c in li.get_text(strip=True))), "")
-        
-        return {"id": uid, "sumber": "infolomba.id", "judul": judul_mentah, "poster": poster_url, "caption": teks_konten, "link_pendaftaran": link_pendaftaran, "timeline": timeline, "link_direct": link}
+        return {"id": uid, "sumber": "infolomba.id", "judul": judul_sementara, "poster": poster_url, "caption": teks_konten, "link_pendaftaran": link_pendaftaran, "timeline": "", "link_direct": link}
     except Exception: return None
 
 def scrape_infolomba(id_sudah_ada):
@@ -141,8 +130,8 @@ def scrape_infolomba(id_sudah_ada):
 
 async def ambil_detail_silomba(card, browser, id_sudah_ada, base_url, semaphore):
     async with semaphore:
-        judul_mentah = card.get('aria-label', '').replace('Lihat detail kompetisi ', '').strip() or (card.find(['h2', 'h3', 'h4']).text.strip() if card.find(['h2', 'h3', 'h4']) else "Tanpa judul")
-        uid = buat_id(judul_mentah, "silomba.id")
+        judul_sementara = card.get('aria-label', '').replace('Lihat detail kompetisi ', '').strip() or (card.find(['h2', 'h3', 'h4']).text.strip() if card.find(['h2', 'h3', 'h4']) else "Tanpa judul")
+        uid = buat_id(judul_sementara, "silomba.id")
         if uid in id_sudah_ada: return None
 
         link_detail = urljoin(base_url, card['href'])
@@ -150,14 +139,13 @@ async def ambil_detail_silomba(card, browser, id_sudah_ada, base_url, semaphore)
         try:
             await dp.goto(link_detail, wait_until="domcontentloaded", timeout=30000)
             dsoup_ori = BeautifulSoup(await dp.content(), 'html.parser')
-            teks_konten = potong_html(BeautifulSoup(await dp.content(), 'html.parser'), "Deskripsi Lomba", "Persyaratan Pendaftaran")
+            teks_konten = potong_html(dsoup_ori, "Deskripsi Lomba", "Persyaratan Pendaftaran")
             if not is_mahasiswa(teks_konten): return None
 
             poster = (dsoup_ori.find('img', src=lambda s: s and 'original-poster' in s) or dsoup_ori.find('img', src=lambda s: s and 'storage2.silomba.id' in s) or {}).get('src', '')
             link_pendaftaran = list(set([btn.get('href') for btn in dsoup_ori.find_all(lambda t: t.name == 'a' and t.text and any(x in t.text for x in ['Daftar', 'Website Resmi', 'Register'])) if btn.get('href') and btn.get('href') != '#' and not btn.get('href').startswith('javascript')]))
-            timeline = next((p.get_text(separator=" ").strip() for p in dsoup_ori.find_all(['p', 'span', 'li']) if any(x in p.text for x in ['Batas Pengumpulan', 'Pendaftaran', 'Pelaksanaan']) and re.search(r'\d{1,2}\s+[A-Za-z]+\s+\d{4}', p.text)), "")
             
-            return {"id": uid, "sumber": "silomba.id", "judul": judul_mentah, "poster": poster, "caption": teks_konten, "link_pendaftaran": link_pendaftaran, "timeline": timeline, "link_direct": link_detail}
+            return {"id": uid, "sumber": "silomba.id", "judul": judul_sementara, "poster": poster, "caption": teks_konten, "link_pendaftaran": link_pendaftaran, "timeline": "", "link_direct": link_detail}
         except Exception: return None
         finally: await dp.close()
 
@@ -224,19 +212,22 @@ def scrape_instagram(id_sudah_ada):
 
                     if not caption or not is_mahasiswa(caption): continue
 
-                    judul_mentah = ekstrak_judul_ig(caption)
-                    uid = buat_id(judul_mentah, f"IG @{akun}")
+                    judul_sementara = caption.split('\n')[0][:100].strip()
+                    if not judul_sementara: judul_sementara = str(time.time())
+                    
+                    uid = buat_id(judul_sementara, f"IG @{akun}")
                     if uid in id_sudah_ada: continue
 
                     poster = driver.execute_script("var i=document.querySelectorAll('img');for(var j=0;j<i.length;j++){var s=i[j].src||'';if(!(i[j].alt||'').toLowerCase().includes('profile')&&!s.includes('150x150')&&(s.includes('scontent')||s.includes('cdninstagram'))){return i[j].srcset?i[j].srcset.split(',').pop().trim().split(' ')[0]:s;}}return '';") or driver.find_element(By.XPATH, '//meta[@property="og:image"]').get_attribute('content')
                     
-                    hasil.append({"id": uid, "sumber": f"IG @{akun}", "judul": judul_mentah, "poster": poster, "caption": caption, "link_pendaftaran": ekstrak_link(caption), "timeline": "", "link_direct": url})
+                    hasil.append({"id": uid, "sumber": f"IG @{akun}", "judul": judul_sementara, "poster": poster, "caption": caption, "link_pendaftaran": [], "timeline": "", "link_direct": url})
                     id_sudah_ada.add(uid)
                 except Exception: pass
     finally: driver.quit()
     return hasil
 
 async def main():
+    print("[INFO] Memulai proses scraping...")
     client = pymongo.MongoClient(MONGO_URI)
     collection = client[DB_NAME][COLLECTION_NAME]
     id_sudah_ada = set(i['id'] for i in collection.find({}, {"id": 1, "_id": 0}) if 'id' in i)
@@ -248,12 +239,18 @@ async def main():
     )
 
     hasil_baru = [i for r in results if isinstance(r, list) for i in r]
+    print(f"[INFO] Total {len(hasil_baru)} data mentah baru ditemukan.")
 
     if hasil_baru:
         hasil_final = []
         for i in range(0, len(hasil_baru), 15):
+            print(f"[INFO] Memproses batch LLM {i//15 + 1}...")
             hasil_final.extend(proses_batch_dengan_gemini(hasil_baru[i:i + 15]))
+            
         collection.bulk_write([UpdateOne({'id': i['id']}, {'$set': i}, upsert=True) for i in hasil_final])
+        print(f"[INFO] Database diperbarui dengan {len(hasil_final)} data.")
+    else:
+        print("[INFO] Tidak ada data baru.")
 
     client.close()
 
