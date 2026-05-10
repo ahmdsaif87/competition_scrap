@@ -5,6 +5,7 @@ import asyncio
 import re
 import hashlib
 import json
+import threading
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
@@ -17,8 +18,6 @@ from selenium.webdriver.support import expected_conditions as EC
 import cloudscraper
 import pymongo
 from pymongo import UpdateOne
-
-# Import Gemini SDK baru
 from google import genai
 
 IG_SESSION_ID = os.environ.get("IG_SESSION_ID", "")
@@ -27,20 +26,25 @@ MONGO_URI = os.environ.get("MONGO_URI")
 DB_NAME = "competition_scraper"
 COLLECTION_NAME = "competition"
 
-# Inisialisasi Gemini Client
 try:
     gemini_client = genai.Client()
 except Exception as e:
     print(f"[WARN] Gagal inisialisasi Gemini Client: {e}")
     gemini_client = None
 
+# --- SISTEM ANTREAN GEMINI (GLOBAL LOCK) ---
+gemini_lock = threading.Lock()
+last_gemini_call = 0.0
+
 def proses_item_dengan_gemini(sumber, teks_mentah, links_mentah, poster_url, judul_mentah):
+    global last_gemini_call
+    
     fallback_dict = {
         "sumber": sumber,
         "judul": judul_mentah,
         "link_pendaftaran": links_mentah,
         "poster": poster_url,
-        "caption": teks_mentah[:1000] + "..." if len(teks_mentah) > 1000 else teks_mentah,
+        "caption": teks_mentah[:800] + "..." if len(teks_mentah) > 800 else teks_mentah,
         "timeline": ""
     }
 
@@ -50,9 +54,9 @@ def proses_item_dengan_gemini(sumber, teks_mentah, links_mentah, poster_url, jud
     prompt = f"""Tugasmu adalah menganalisis teks informasi lomba dan merapikannya ke dalam format JSON.
 1. "sumber": Gunakan nilai "{sumber}".
 2. "judul": EKSTRAK judul acara/kompetisi utama langsung dari "Teks Asli". Abaikan "Judul Mentah" jika isinya "Tanpa Judul" atau tidak relevan. Buat judul yang bersih dan profesional.
-3. "link_pendaftaran": Pastikan ini berupa array berisi string URL valid (gabungkan dari "Link Pendaftaran Mentah" dan URL yang mungkin tersembunyi di "Teks Asli").
+3. "link_pendaftaran": Pastikan ini berupa array berisi string URL valid (gabungkan dari "Link Pendaftaran Mentah" dan URL pendaftaran yang mungkin tersembunyi di "Teks Asli").
 4. "poster": Gunakan URL "{poster_url}".
-5. "caption": Buat caption yang sudah diperindah dari "Teks Asli", rapikan paragraf, perbaiki typo, dan buang hashtag spam.
+5. "caption": Buat caption yang sudah diperindah dari "Teks Asli" (ABAIKAN teks menu navigasi website seperti Home, Tips, Bookmark, dsb jika masih ada). Rapikan paragraf, perbaiki typo, dan buang hashtag spam.
 6. "timeline": Ekstrak tanggal/timeline pendaftaran atau pelaksanaan lomba dari "Teks Asli".
 
 Keluarkan HANYA dalam format JSON dengan struktur yang persis seperti ini:
@@ -70,38 +74,45 @@ Judul Mentah: {judul_mentah}
 Link Pendaftaran Mentah: {links_mentah}
 Teks Asli: {teks_mentah}"""
 
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            response = gemini_client.models.generate_content(
-                model="gemini-2.0-flash",
-                contents=prompt,
-                config={"response_mime_type": "application/json"}
-            )
-            
-            hasil_llm = json.loads(response.text)
-            
-            # Validasi pengaman
-            for key in fallback_dict.keys():
-                if key not in hasil_llm:
-                    hasil_llm[key] = fallback_dict[key]
-                    
-            # Jeda aman 4 detik untuk Free Tier Gemini (15 Request Per Minute)
-            time.sleep(4)
-            return hasil_llm
+    with gemini_lock:
+        waktu_sekarang = time.time()
+        jeda_berlalu = waktu_sekarang - last_gemini_call
+        
+        if jeda_berlalu < 4.2:
+            time.sleep(4.2 - jeda_berlalu)
 
-        except Exception as e:
-            error_str = str(e).lower()
-            if "429" in error_str or "quota" in error_str or "rate limit" in error_str:
-                wait_time = 15.0
-                print(f"  [WAIT] Gemini Limit (Percobaan {attempt+1}/{max_retries}). Menunggu {wait_time} detik...")
-                time.sleep(wait_time)
-            else:
-                print(f"  [WARN] Error memanggil Gemini API: {e}")
-                return fallback_dict
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = gemini_client.models.generate_content(
+                    model="gemini-2.0-flash", 
+                    contents=prompt,
+                    config={"response_mime_type": "application/json"}
+                )
+                
+                hasil_llm = json.loads(response.text)
+                last_gemini_call = time.time()
+                
+                for key in fallback_dict.keys():
+                    if key not in hasil_llm:
+                        hasil_llm[key] = fallback_dict[key]
+                        
+                return hasil_llm
 
-    print("  [WARN] Gagal memanggil Gemini setelah 3 kali mencoba. Menggunakan data mentah.")
-    return fallback_dict
+            except Exception as e:
+                error_str = str(e).lower()
+                if "429" in error_str or "quota" in error_str or "rate limit" in error_str:
+                    wait_time = 15.0
+                    print(f"  [WAIT] Gemini Limit. Istirahat {wait_time} detik...")
+                    time.sleep(wait_time)
+                else:
+                    print(f"  [WARN] Error Gemini: {e}")
+                    last_gemini_call = time.time() 
+                    return fallback_dict
+
+        print("  [WARN] Gagal memanggil Gemini setelah 3 kali mencoba.")
+        last_gemini_call = time.time()
+        return fallback_dict
 
 
 def is_untuk_mahasiswa(teks):
@@ -139,6 +150,27 @@ def ekstrak_link_pendaftaran(caption):
     if "bio" in caption.lower(): return ["Link Belum Tersedia"]
     return []
 
+# --- PEMBERSIH TEKS HTML (SANDWICH METHOD) ---
+def bersihkan_teks_web(dsoup, pemisah_atas, pemisah_bawah):
+    # Hapus tag sampah secara brutal
+    for tag in dsoup(['nav', 'header', 'footer', 'aside', 'script', 'style']):
+        tag.decompose()
+    
+    # Ambil teks sisa
+    teks_kotor = dsoup.get_text(separator='\n')
+    
+    # Potong bagian tengahnya saja (Sandwich method)
+    if pemisah_atas in teks_kotor and pemisah_bawah in teks_kotor:
+        teks_bersih = teks_kotor.split(pemisah_atas)[-1].split(pemisah_bawah)[0]
+    elif pemisah_atas in teks_kotor:
+        teks_bersih = teks_kotor.split(pemisah_atas)[-1]
+    else:
+        teks_bersih = teks_kotor
+        
+    # Rapikan enter berlebih
+    return re.sub(r'\n\s*\n', '\n', teks_bersih).strip()
+
+
 def scrape_infolomba(id_sudah_ada):
     print("[INFO] Mulai infolomba.id...")
     base_url = "https://infolomba.id"
@@ -153,13 +185,15 @@ def scrape_infolomba(id_sudah_ada):
                 res = scraper.get(link, headers=HEADERS)
                 if res.status_code != 200: continue
                 dsoup = BeautifulSoup(res.text, 'html.parser')
-                full_text = dsoup.get_text(separator=' ')
-                if not is_untuk_mahasiswa(full_text): continue
+                
+                # Gunakan pembersih teks khusus Infolomba
+                teks_konten = bersihkan_teks_web(dsoup, "Daftar Sekarang", "Laporkan Lomba")
+                
+                if not is_untuk_mahasiswa(teks_konten): continue
 
                 judul_mentah = '-'.join(link.rstrip('/').split('/')[-1].replace('info-', '', 1).split('-')[:-1]).replace('-', ' ').title()
                 uid = buat_id_unik(judul_mentah, "infolomba.id")
                 
-                # Filter DB sebelum panggil LLM
                 if uid in id_sudah_ada: continue
 
                 poster_url = (a.find('img') or {}).get('src') or (a.find('img') or {}).get('data-src')
@@ -171,11 +205,12 @@ def scrape_infolomba(id_sudah_ada):
                 if not poster_url:
                     poster_url = next((urljoin(base_url, img.get('src') or img.get('data-src', '')) for img in dsoup.find_all('img') if '/poster/' in (img.get('src') or img.get('data-src', ''))), '')
 
-                btn = dsoup.find(lambda t: t.name == 'a' and t.text and 'Daftar Sekarang' in t.text)
+                # Refresh parser untuk cari button pendaftaran
+                dsoup_ori = BeautifulSoup(res.text, 'html.parser') 
+                btn = dsoup_ori.find(lambda t: t.name == 'a' and t.text and 'Daftar Sekarang' in t.text)
                 link_pendaftaran = [btn['href']] if btn and btn.get('href') and btn['href'] not in ['#', ''] and not btn['href'].startswith('javascript') else []
 
-                # Panggil Gemini
-                item_llm = proses_item_dengan_gemini("infolomba.id", full_text, link_pendaftaran, poster_url, judul_mentah)
+                item_llm = proses_item_dengan_gemini("infolomba.id", teks_konten, link_pendaftaran, poster_url, judul_mentah)
 
                 hasil.append({
                     "id": uid, 
@@ -202,7 +237,7 @@ async def scrape_silomba(id_sudah_ada):
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
         try:
-            await page.goto(base_url, wait_until="networkidle")
+            await page.goto(base_url, wait_until="domcontentloaded", timeout=60000)
             await page.wait_for_selector("#competition-section", timeout=15000)
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await page.wait_for_timeout(2000)
@@ -214,24 +249,26 @@ async def scrape_silomba(id_sudah_ada):
                 judul_mentah = card.get('aria-label', '').replace('Lihat detail kompetisi ', '').strip() or (card.find(['h2', 'h3', 'h4']).text.strip() if card.find(['h2', 'h3', 'h4']) else "Tanpa judul")
                 uid = buat_id_unik(judul_mentah, "silomba.id")
                 
-                # Filter DB sebelum panggil LLM
                 if uid in id_sudah_ada: continue
 
                 link_detail = urljoin(base_url, card['href'])
                 poster, link_pendaftaran = '', []
                 try:
                     dp = await browser.new_page()
-                    await dp.goto(link_detail, wait_until="networkidle")
+                    await dp.goto(link_detail, wait_until="domcontentloaded", timeout=45000)
                     dsoup = BeautifulSoup(await dp.content(), 'html.parser')
                     await dp.close()
-                    full_text = dsoup.get_text(separator=' ')
-                    if not is_untuk_mahasiswa(full_text): continue
-
-                    poster = (dsoup.find('img', src=lambda s: s and 'original-poster' in s) or dsoup.find('img', src=lambda s: s and 'storage2.silomba.id' in s) or {}).get('src', '')
-                    link_pendaftaran = list(set([btn.get('href') for btn in dsoup.find_all(lambda t: t.name == 'a' and t.text and any(x in t.text for x in ['Daftar', 'Website Resmi', 'Register'])) if btn.get('href') and btn.get('href') != '#' and not btn.get('href').startswith('javascript')]))
                     
-                    # Panggil Gemini
-                    item_llm = await asyncio.to_thread(proses_item_dengan_gemini, "silomba.id", full_text, link_pendaftaran, poster, judul_mentah)
+                    # Gunakan pembersih teks khusus Silomba
+                    teks_konten = bersihkan_teks_web(dsoup, "Deskripsi Lomba", "Persyaratan Pendaftaran")
+                    if not is_untuk_mahasiswa(teks_konten): continue
+
+                    # Refresh parser untuk cari elemen asli
+                    dsoup_ori = BeautifulSoup(await dp.content(), 'html.parser')
+                    poster = (dsoup_ori.find('img', src=lambda s: s and 'original-poster' in s) or dsoup_ori.find('img', src=lambda s: s and 'storage2.silomba.id' in s) or {}).get('src', '')
+                    link_pendaftaran = list(set([btn.get('href') for btn in dsoup_ori.find_all(lambda t: t.name == 'a' and t.text and any(x in t.text for x in ['Daftar', 'Website Resmi', 'Register'])) if btn.get('href') and btn.get('href') != '#' and not btn.get('href').startswith('javascript')]))
+                    
+                    item_llm = await asyncio.to_thread(proses_item_dengan_gemini, "silomba.id", teks_konten, link_pendaftaran, poster, judul_mentah)
 
                     hasil.append({
                         "id": uid, 
@@ -305,7 +342,6 @@ def scrape_instagram(id_sudah_ada):
                     judul_mentah = ekstrak_judul_dari_caption(caption)
                     uid = buat_id_unik(judul_mentah, f"IG @{akun}")
                     
-                    # Filter DB sebelum panggil LLM
                     if uid in id_sudah_ada: continue
 
                     poster = driver.execute_script("""
@@ -321,7 +357,6 @@ def scrape_instagram(id_sudah_ada):
 
                     links_mentah = ekstrak_link_pendaftaran(caption)
 
-                    # Panggil Gemini
                     item_llm = proses_item_dengan_gemini(f"IG @{akun}", caption, links_mentah, poster, judul_mentah)
 
                     hasil.append({
@@ -347,7 +382,6 @@ async def main():
     client = pymongo.MongoClient(MONGO_URI)
     collection = client[DB_NAME][COLLECTION_NAME]
     
-    # Menarik ID yang sudah ada di database
     id_sudah_ada = get_existing_ids_from_db(collection)
 
     results = await asyncio.gather(
