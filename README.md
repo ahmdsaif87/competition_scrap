@@ -1,17 +1,19 @@
 # Competition Scraper
 
-Scraper otomatis untuk mengumpulkan informasi lomba/kompetisi khusus **mahasiswa dan umum** dari berbagai sumber, yang berjalan setiap hari jam **00.00 WIB** via GitHub Actions.
+Tools untuk mengumpulkan informasi lomba dan kompetisi dari beberapa sumber web dan akun instagram.
 
----
+## Fitur
 
-## Sumber Data
+- Menyisir situs lomba dan akun Instagram untuk data kompetisi
+- Dijalankan otomatis setiap hari (GitHub Actions atau scheduler lain)
+- Format data siap untuk diproses lebih lanjut
 
-| Sumber | Metode | Status |
-|--------|--------|--------|
-| [infolomba.id](https://infolomba.id) | HTTP + BeautifulSoup | ✅ Aktif |
-| [silomba.id](https://silomba.id) | Playwright (JS Render) | ✅ Aktif |
-| Instagram `@infolomba` | Selenium + Cookie | ✅ Aktif |
-| Instagram `@infolomba_gratis` | Selenium + Cookie | ✅ Aktif |
-| Instagram `@infolomba.olimpiade` | Selenium + Cookie | ✅ Aktif |
+## Cara pakai
 
----
+1. Install dependensi di `requirements.txt`
+2. Jalankan `python scraper.py`
+3. Periksa hasil output sesuai konfigurasi
+
+## Tujuan
+
+Mempermudah pengumpulan informasi lomba bagi mahasiswa dan umum tanpa memeriksa sumber secara manual.
