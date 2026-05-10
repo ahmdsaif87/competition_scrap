@@ -2,6 +2,7 @@ import os
 import time
 import random
 import asyncio
+import re
 import hashlib
 import json
 from urllib.parse import urljoin
@@ -39,17 +40,19 @@ def proses_batch_dengan_gemini(data_batch):
         payload_llm.append({
             "id": i["id"],
             "sumber": i["sumber"],
-            "teks": i["caption"][:1200],
-            "link_web": i["link_pendaftaran"]
+            "judul_mentah": i["judul"],
+            "timeline_mentah": i["timeline"],
+            "link_web": i["link_pendaftaran"],
+            "teks_info": i["caption"][:1200]
         })
 
-    prompt = f"""Ekstrak informasi menjadi array JSON berdasarkan data mentah.
-ATURAN:
-1. "judul": Ekstrak judul lomba/acara yang bersih dari "teks". Jangan gunakan sapaan.
-2. "timeline": Ekstrak informasi jadwal/tanggal pelaksanaan/pendaftaran dari "teks". Jika tidak ada, kembalikan string kosong "".
-3. "link_pendaftaran": Jika "sumber" berisi teks "IG", ekstrak URL (seperti bit.ly, forms.gle, dsb) dari dalam "teks" menjadi array. Jika bukan IG, gunakan isi dari "link_web" persis seperti aslinya.
-4. JANGAN ubah nilai "id".
-5. Format keluaran wajib JSON Array murni: [{{"id": "...", "judul": "...", "timeline": "...", "link_pendaftaran": ["..."]}}]
+    prompt = f"""Kamu adalah AI Data Extractor. Ekstrak dan perbaiki data dari JSON Array berikut.
+ATURAN WAJIB:
+1. "judul": Temukan nama resmi acara/kompetisi dari "teks_info". HAPUS SEMUA emoji, simbol markdown (*, _), dan kalimat sapaan (seperti "Hi pelajar!", "Telah dibuka"). 
+2. "timeline": Cari jadwal (Pendaftaran/Pelaksanaan) dari "teks_info" atau gunakan "timeline_mentah". Hapus emoji. Jika tidak ada, isi "".
+3. "link_pendaftaran": Gabungkan URL dari "link_web" dan SEMUA URL pendaftaran di "teks_info". Pastikan output berupa array of strings.
+4. JANGAN ubah "id".
+5. Keluarkan HANYA JSON Array valid tanpa blok kode markdown.
 
 Data Mentah:
 {json.dumps(payload_llm, ensure_ascii=False)}"""
@@ -68,8 +71,10 @@ Data Mentah:
             for item in data_batch:
                 llm_data = llm_dict.get(str(item["id"]), {})
                 item["judul"] = llm_data.get("judul", item["judul"])
-                item["timeline"] = llm_data.get("timeline", "")
-                item["link_pendaftaran"] = llm_data.get("link_pendaftaran", item["link_pendaftaran"])
+                item["timeline"] = llm_data.get("timeline", item["timeline"])
+                gabungan_link = item["link_pendaftaran"] + llm_data.get("link_pendaftaran", [])
+                item["link_pendaftaran"] = list(dict.fromkeys(gabungan_link))
+                
             time.sleep(3)
             return data_batch
         except Exception:
@@ -78,10 +83,20 @@ Data Mentah:
     return data_batch
 
 def is_mahasiswa(teks):
-    return any(kw in str(teks).lower() for kw in ['mahasiswa', 'mahasiswi', 'universitas', 'kampus', 's1', 'd3', 'd4', 'umum', 'undergraduate', 'diploma', 'student', 'university'])
+    teks_lower = str(teks).lower()
+    keywords = ['mahasiswa', 'mahasiswi', 'universitas', 'kampus', 's1', 'd3', 'd4', 'umum', 'undergraduate', 'diploma', 'student', 'university']
+    reject_words = ['siswa', 'pelajar', 'smp', 'sd', 'mts', 'sekolah dasar', 'high schooler']
+    
+    if any(rw in teks_lower for rw in reject_words) and not any(kw in teks_lower for kw in keywords):
+        return False
+    return any(kw in teks_lower for kw in keywords)
 
 def buat_id(judul, sumber):
     return hashlib.md5(f"{sumber}_{judul}".lower().strip().encode()).hexdigest()[:12]
+
+def ekstrak_link(caption):
+    links = re.findall(r'(https?://[^\s]+|www\.[^\s]+|bit\.ly/[^\s]+|linktr\.ee/[^\s]+|forms\.gle/[^\s]+|s\.id/[^\s]+)', caption)
+    return [re.sub(r'[).,!]+$', '', l) for l in links] if links else []
 
 def potong_html(dsoup, top, bot):
     for tag in dsoup(['nav', 'header', 'footer', 'aside', 'script', 'style']): tag.decompose()
@@ -113,7 +128,9 @@ def ambil_detail_infolomba(link, a, id_sudah_ada, base_url, scraper):
         btn = dsoup_ori.find(lambda t: t.name == 'a' and t.text and 'Daftar Sekarang' in t.text)
         link_pendaftaran = [btn['href']] if btn and btn.get('href') and btn['href'] not in ['#', ''] and not btn['href'].startswith('javascript') else []
 
-        return {"id": uid, "sumber": "infolomba.id", "judul": judul_sementara, "poster": poster_url, "caption": teks_konten, "link_pendaftaran": link_pendaftaran, "timeline": "", "link_direct": link}
+        timeline = next((li.get_text(strip=True).replace('📅', '').replace('🗓', '').strip() for li in dsoup_ori.find_all(['li', 'div', 'p']) if ('📅' in li.text or '🗓' in li.text or re.search(r'\d{1,2}\s+[A-Za-z]+\s*-\s*\d{1,2}\s+[A-Za-z]+', li.text)) and len(li.get_text(strip=True)) < 50 and any(c.isdigit() for c in li.get_text(strip=True))), "")
+
+        return {"id": uid, "sumber": "infolomba.id", "judul": judul_sementara, "poster": poster_url, "caption": teks_konten, "link_pendaftaran": link_pendaftaran, "timeline": timeline, "link_direct": link}
     except Exception: return None
 
 def scrape_infolomba(id_sudah_ada):
@@ -144,8 +161,9 @@ async def ambil_detail_silomba(card, browser, id_sudah_ada, base_url, semaphore)
 
             poster = (dsoup_ori.find('img', src=lambda s: s and 'original-poster' in s) or dsoup_ori.find('img', src=lambda s: s and 'storage2.silomba.id' in s) or {}).get('src', '')
             link_pendaftaran = list(set([btn.get('href') for btn in dsoup_ori.find_all(lambda t: t.name == 'a' and t.text and any(x in t.text for x in ['Daftar', 'Website Resmi', 'Register'])) if btn.get('href') and btn.get('href') != '#' and not btn.get('href').startswith('javascript')]))
+            timeline = next((p.get_text(separator=" ").strip() for p in dsoup_ori.find_all(['p', 'span', 'li']) if any(x in p.text for x in ['Batas Pengumpulan', 'Pendaftaran', 'Pelaksanaan']) and re.search(r'\d{1,2}\s+[A-Za-z]+\s+\d{4}', p.text)), "")
             
-            return {"id": uid, "sumber": "silomba.id", "judul": judul_sementara, "poster": poster, "caption": teks_konten, "link_pendaftaran": link_pendaftaran, "timeline": "", "link_direct": link_detail}
+            return {"id": uid, "sumber": "silomba.id", "judul": judul_sementara, "poster": poster, "caption": teks_konten, "link_pendaftaran": link_pendaftaran, "timeline": timeline, "link_direct": link_detail}
         except Exception: return None
         finally: await dp.close()
 
@@ -220,7 +238,9 @@ def scrape_instagram(id_sudah_ada):
 
                     poster = driver.execute_script("var i=document.querySelectorAll('img');for(var j=0;j<i.length;j++){var s=i[j].src||'';if(!(i[j].alt||'').toLowerCase().includes('profile')&&!s.includes('150x150')&&(s.includes('scontent')||s.includes('cdninstagram'))){return i[j].srcset?i[j].srcset.split(',').pop().trim().split(' ')[0]:s;}}return '';") or driver.find_element(By.XPATH, '//meta[@property="og:image"]').get_attribute('content')
                     
-                    hasil.append({"id": uid, "sumber": f"IG @{akun}", "judul": judul_sementara, "poster": poster, "caption": caption, "link_pendaftaran": [], "timeline": "", "link_direct": url})
+                    link_awal = ekstrak_link(caption)
+
+                    hasil.append({"id": uid, "sumber": f"IG @{akun}", "judul": judul_sementara, "poster": poster, "caption": caption, "link_pendaftaran": link_awal, "timeline": "", "link_direct": url})
                     id_sudah_ada.add(uid)
                 except Exception: pass
     finally: driver.quit()
