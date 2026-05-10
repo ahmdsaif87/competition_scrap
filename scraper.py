@@ -451,17 +451,118 @@ def scrape_instagram(id_sudah_ada: set) -> list[dict]:
     return hasil
 
 
+
+
+# ---------------------------------------------------------------------------
+# DEDUP — 3 lapis pengecekan duplikat
+#
+# Lapis 1 (paling awal, di scraper): cek id — sudah ada sejak awal
+# Lapis 2 (vs DB, setelah LLM): cek link_direct exact match
+# Lapis 3 (vs DB, setelah LLM): cek Jaccard similarity judul (fallback)
+# Lapis 4 (antar item baru):    cek Jaccard similarity judul antar sumber
+#
+# Urutan prioritas sumber jika duplikat: infolomba.id > silomba.id > IG
+# link_pendaftaran dari duplikat selalu digabung supaya tidak ada yang hilang
+# ---------------------------------------------------------------------------
+def normalisasi_judul(judul: str) -> set:
+    stopwords = {
+        'the', 'of', 'and', 'in', 'on', 'at', 'to', 'a', 'an',
+        'di', 'ke', 'se', 'dan', 'atau', 'untuk', 'dengan', 'dalam',
+        'dari', 'oleh', 'yang', 'adalah', 'ini', 'itu',
+    }
+    judul_bersih = re.sub(r'[^\w\s]', ' ', judul.lower())
+    return {t for t in judul_bersih.split() if t not in stopwords and len(t) > 1}
+
+
+def jaccard(a: set, b: set) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+PRIORITAS_SUMBER = {"infolomba.id": 0, "silomba.id": 1}  # IG default 2
+
+
+def prioritas(item: dict) -> int:
+    return PRIORITAS_SUMBER.get(item["sumber"], 2)
+
+
+def dedup_hasil(
+    hasil_baru: list,
+    data_di_db: list,          # list of {"judul": str, "link_direct": str}
+    threshold: float = 0.6,
+) -> list:
+    """
+    Hapus duplikat hasil scrape baru terhadap DB dan antar sumber.
+
+    Urutan cek per item baru:
+      1. link_direct exact match vs DB → skip (pasti duplikat)
+      2. Jaccard judul vs DB           → skip jika >= threshold
+      3. Jaccard judul vs sesama item baru → gabung/ganti sesuai prioritas sumber
+    """
+    # Siapkan indeks DB
+    link_direct_db: set = {d["link_direct"] for d in data_di_db if d.get("link_direct")}
+    token_judul_db: list = [normalisasi_judul(d["judul"]) for d in data_di_db if d.get("judul")]
+
+    unik: list = []
+
+    for item in hasil_baru:
+        judul_item  = item.get("judul", "")
+        link_item   = item.get("link_direct", "")
+        token_item  = normalisasi_judul(judul_item)
+
+        # --- Lapis 2: link_direct exact match vs DB ---
+        if link_item and link_item in link_direct_db:
+            print(f"[DEDUP-DB] Skip (URL sama): {link_item}")
+            continue
+
+        # --- Lapis 3: Jaccard judul vs DB ---
+        if any(jaccard(token_item, t) >= threshold for t in token_judul_db):
+            print(f"[DEDUP-DB] Skip (judul mirip di DB): {judul_item!r}")
+            continue
+
+        # --- Lapis 4: Jaccard judul vs sesama item baru ---
+        duplikat_idx = None
+        for idx, existing in enumerate(unik):
+            skor = jaccard(token_item, normalisasi_judul(existing.get("judul", "")))
+            if skor >= threshold:
+                duplikat_idx = idx
+                break
+
+        if duplikat_idx is not None:
+            existing = unik[duplikat_idx]
+            gabungan_link = list(dict.fromkeys(
+                existing["link_pendaftaran"] + item["link_pendaftaran"]
+            ))
+            if prioritas(item) < prioritas(existing):
+                # Item baru lebih primer → ganti, pertahankan link gabungan
+                item["link_pendaftaran"] = gabungan_link
+                unik[duplikat_idx] = item
+                print(f"[DEDUP-NEW] Ganti {existing['sumber']} → {item['sumber']}: {judul_item!r}")
+            else:
+                # Existing lebih primer → cukup gabung link
+                unik[duplikat_idx]["link_pendaftaran"] = gabungan_link
+                print(f"[DEDUP-NEW] Gabung link {item['sumber']} → {existing['sumber']}: {judul_item!r}")
+        else:
+            unik.append(item)
+
+    print(f"[DEDUP] {len(hasil_baru)} item masuk → {len(unik)} item unik.")
+    return unik
+
+
 # ---------------------------------------------------------------------------
 # MAIN
-# Alur: scrape paralel → raw JSON → LLM batch → simpan DB
+# Alur: scrape paralel → LLM batch → dedup (vs DB + antar sumber) → simpan DB
 # ---------------------------------------------------------------------------
 async def main():
     print("[INFO] Menghubungkan ke MongoDB...")
     client = pymongo.MongoClient(MONGO_URI)
     collection = client[DB_NAME][COLLECTION_NAME]
-    id_sudah_ada = set(
-        i['id'] for i in collection.find({}, {"id": 1, "_id": 0}) if 'id' in i
-    )
+
+    # Ambil id, link_direct, dan judul dari DB sekaligus untuk semua lapisan dedup
+    data_di_db = list(collection.find({}, {"id": 1, "link_direct": 1, "judul": 1, "_id": 0}))
+    id_sudah_ada   = {d["id"] for d in data_di_db if "id" in d}
+    print(f"[INFO] {len(id_sudah_ada)} data sudah ada di DB.")
 
     # === FASE 1: SCRAPING PARALEL ===
     results = await asyncio.gather(
@@ -470,7 +571,7 @@ async def main():
         asyncio.to_thread(scrape_instagram, id_sudah_ada),
     )
 
-    hasil_mentah: list[dict] = [
+    hasil_mentah: list = [
         item for batch in results if isinstance(batch, list) for item in batch
     ]
     print(f"[INFO] Total {len(hasil_mentah)} data mentah baru ditemukan.")
@@ -482,13 +583,21 @@ async def main():
 
     # === FASE 2: LLM — ekstrak judul (semua) + link_pendaftaran (IG) ===
     BATCH_SIZE = 15
-    hasil_final: list[dict] = []
+    hasil_llm: list = []
     for i in range(0, len(hasil_mentah), BATCH_SIZE):
         batch = hasil_mentah[i:i + BATCH_SIZE]
         print(f"[LLM] Batch {i // BATCH_SIZE + 1} ({len(batch)} item)...")
-        hasil_final.extend(proses_batch_dengan_gemini(batch))
+        hasil_llm.extend(proses_batch_dengan_gemini(batch))
 
-    # === FASE 3: SIMPAN KE DATABASE ===
+    # === FASE 3: DEDUP — vs DB (link_direct + judul) dan antar sumber ===
+    hasil_final = dedup_hasil(hasil_llm, data_di_db, threshold=0.6)
+
+    if not hasil_final:
+        print("[INFO] Semua data duplikat atau sudah ada di DB.")
+        client.close()
+        return
+
+    # === FASE 4: SIMPAN KE DATABASE ===
     result = collection.bulk_write([
         UpdateOne({'id': item['id']}, {'$set': item}, upsert=True)
         for item in hasil_final
