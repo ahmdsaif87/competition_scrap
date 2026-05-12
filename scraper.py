@@ -19,7 +19,9 @@ import pymongo
 from pymongo import UpdateOne
 from google import genai
 
+# =============================================================================
 # CONFIG
+# =============================================================================
 IG_SESSION_ID = os.environ.get("IG_SESSION_ID", "")
 MONGO_URI     = os.environ.get("MONGO_URI")
 DB_NAME       = "competition_scraper"
@@ -35,7 +37,9 @@ except Exception:
     gemini_model = None
 
 
+# =============================================================================
 # HELPERS
+# =============================================================================
 def buat_id(judul: str, sumber: str) -> str:
     return hashlib.md5(f"{sumber}_{judul}".lower().strip().encode()).hexdigest()[:12]
 
@@ -49,15 +53,27 @@ def is_mahasiswa(teks: str) -> bool:
     return any(kw in teks.lower() for kw in keywords)
 
 
+# =============================================================================
 # LLM
+# Website : ekstrak judul dari caption (caption[:400])
+# IG      : ekstrak judul + link_pendaftaran dari caption (caption[:1000])
+# Key payload disingkat (i/c/j/l) untuk hemat token.
+# =============================================================================
 def _llm_call(prompt: str) -> list:
     for attempt in range(3):
         try:
-            return json.loads(gemini_model.generate_content(prompt).text)
+            raw = gemini_model.generate_content(prompt).text
+            print(f"[LLM] Raw response: {raw[:300]}")
+            return json.loads(raw)
         except Exception as e:
             print(f"[LLM] Error attempt {attempt + 1}: {e}")
             time.sleep(15)
     return []
+
+
+def _strip_emoji(teks: str) -> str:
+    """Hapus semua emoji dan simbol non-ASCII dari string."""
+    return re.sub(r'[^\u0000-\u024F\u1E00-\u1EFF]', '', teks).strip()
 
 
 def proses_batch_dengan_gemini(data_batch: list) -> list:
@@ -66,36 +82,47 @@ def proses_batch_dengan_gemini(data_batch: list) -> list:
 
     grup_web = [x for x in data_batch if "IG" not in x["sumber"]]
     grup_ig  = [x for x in data_batch if "IG"     in x["sumber"]]
-    llm_map  = {}
+
+    # llm_map: key = id (string), value = {judul, link_pendaftaran}
+    llm_map: dict = {}
 
     if grup_web:
-        payload  = [{"i": x["id"], "c": x["caption"][:400]} for x in grup_web]
+        payload = [{"i": x["id"], "c": x["caption"][:400]} for x in grup_web]
         instruksi = (
-            'Ekstrak nama resmi lomba dari field c tiap item. '
-            'Hapus emoji, simbol (* _ # >), sapaan pembuka. '
-            'Jika tidak ada tulis "Tanpa Judul". '
-            'Output JSON Array. Format: {"i":"...","j":"..."}'
+            'Dari field c tiap item, temukan nama resmi lomba/kompetisi. '
+            'Nama lomba biasanya mengandung kata: Kompetisi, Lomba, Competition, Olympiad, Hackathon, Festival, Award, Call for. '
+            'WAJIB hapus semua emoji dan simbol dari hasil. Contoh: "🚀 Open Registration BMC 2026⭐" → "Open Registration BMC 2026". '
+            'Jika tidak ditemukan tulis "Tanpa Judul". '
+            'Output JSON Array. Format tiap item: {"i":"...","j":"..."}'
         )
-        for row in _llm_call(instruksi + "\n\nData: " + json.dumps(payload, ensure_ascii=False)):
-            llm_map[row.get("i", "")] = {"judul": row.get("j", ""), "link_pendaftaran": []}
+        hasil = _llm_call(instruksi + "\n\nData: " + json.dumps(payload, ensure_ascii=False))
+        for row in hasil:
+            uid = str(row.get("i", ""))
+            llm_map[uid] = {
+                "judul": _strip_emoji(row.get("j", "")),
+                "link_pendaftaran": [],
+            }
 
     if grup_ig:
-        payload  = [{"i": x["id"], "c": x["caption"][:1000]} for x in grup_ig]
+        payload = [{"i": x["id"], "c": x["caption"][:1000]} for x in grup_ig]
         instruksi = (
-            'Dari field c tiap item ekstrak: '
-            '1) j: nama resmi lomba, hapus emoji/simbol/sapaan, jika tidak ada tulis "Tanpa Judul". '
-            '2) l: semua URL di caption sebagai array string, jika tidak ada tulis []. '
-            'Output JSON Array. Format: {"i":"...","j":"...","l":[]}'
+            'Dari field c tiap item ekstrak dua hal: '
+            '1) j: nama resmi lomba/kompetisi. WAJIB hapus semua emoji dan simbol. Contoh: "🚀 Open Registration BMC 2026⭐" → "Open Registration BMC 2026". Jika tidak ada tulis "Tanpa Judul". '
+            '2) l: array semua URL yang ada di caption (http/https/bit.ly/s.id/linktr.ee/forms.gle). Jika tidak ada URL tulis []. '
+            'Output JSON Array. Format tiap item: {"i":"...","j":"...","l":[]}'
         )
-        for row in _llm_call(instruksi + "\n\nData: " + json.dumps(payload, ensure_ascii=False)):
-            llm_map[row.get("i", "")] = {
-                "judul": row.get("j", ""),
+        hasil = _llm_call(instruksi + "\n\nData: " + json.dumps(payload, ensure_ascii=False))
+        for row in hasil:
+            uid = str(row.get("i", ""))
+            llm_map[uid] = {
+                "judul": _strip_emoji(row.get("j", "")),
                 "link_pendaftaran": list(dict.fromkeys(row.get("l", []))),
             }
 
     for item in data_batch:
-        llm = llm_map.get(item["id"], {})
-        item["judul"] = llm.get("judul") or item["judul"]
+        llm = llm_map.get(str(item["id"]), {})  # pastikan key selalu string
+        if llm.get("judul"):
+            item["judul"] = llm["judul"]
         if "IG" in item["sumber"]:
             item["link_pendaftaran"] = llm.get("link_pendaftaran", [])
 
@@ -103,7 +130,11 @@ def proses_batch_dengan_gemini(data_batch: list) -> list:
     return data_batch
 
 
+# =============================================================================
 # SCRAPER: infolomba.id
+# Scrape : poster, caption, link_pendaftaran, link_direct
+# LLM    : judul
+# =============================================================================
 def scrape_infolomba(id_sudah_ada: set) -> list:
     print("[infolomba] Mulai scraping...")
     base_url = "https://infolomba.id"
@@ -189,7 +220,11 @@ def scrape_infolomba(id_sudah_ada: set) -> list:
     return hasil
 
 
+# =============================================================================
 # SCRAPER: silomba.id
+# Scrape : poster, caption, link_pendaftaran, link_direct
+# LLM    : judul
+# =============================================================================
 async def scrape_silomba(id_sudah_ada: set) -> list:
     print("[silomba] Mulai scraping...")
     base_url = "https://silomba.id"
@@ -272,7 +307,11 @@ async def scrape_silomba(id_sudah_ada: set) -> list:
     return hasil
 
 
+# =============================================================================
 # SCRAPER: Instagram
+# Scrape : poster, caption, link_direct
+# LLM    : judul + link_pendaftaran (dari caption)
+# =============================================================================
 def scrape_instagram(id_sudah_ada: set) -> list:
     if not IG_SESSION_ID:
         print("[IG] IG_SESSION_ID tidak diset, skip.")
@@ -384,7 +423,14 @@ def scrape_instagram(id_sudah_ada: set) -> list:
     return hasil
 
 
+# =============================================================================
 # DEDUP
+# Lapis 1 — id exact match          : dicegah di scraper (id_sudah_ada)
+# Lapis 2 — link_direct exact match : vs DB
+# Lapis 3 — Jaccard similarity judul: vs DB (threshold 0.6)
+# Lapis 4 — Jaccard similarity judul: antar item baru, gabung link, menang prioritas
+# Prioritas sumber: infolomba.id (0) > silomba.id (1) > IG (2)
+# =============================================================================
 def _token_judul(judul: str) -> set:
     stopwords = {
         'the','of','and','in','on','at','to','a','an',
@@ -443,7 +489,13 @@ def dedup_hasil(hasil_baru: list, data_di_db: list, threshold: float = 0.6) -> l
     return unik
 
 
+# =============================================================================
 # MAIN
+# Fase 1: scrape paralel
+# Fase 2: LLM (judul semua sumber, link_pendaftaran IG)
+# Fase 3: dedup vs DB + antar sumber
+# Fase 4: simpan ke MongoDB
+# =============================================================================
 async def main():
     print("[INFO] Menghubungkan ke MongoDB...")
     client     = pymongo.MongoClient(MONGO_URI)
