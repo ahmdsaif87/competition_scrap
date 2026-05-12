@@ -54,77 +54,61 @@ def is_mahasiswa(teks: str) -> bool:
 
 
 # =============================================================================
-# LLM
-# Website : ekstrak judul dari caption (caption[:400])
-# IG      : ekstrak judul + link_pendaftaran dari caption (caption[:1000])
-# Key payload disingkat (i/c/j/l) untuk hemat token.
+# HELPERS: URL & emoji
+# =============================================================================
+_URL_PATTERN = re.compile(
+    r'(?:https?://|www\.|bit\.ly/|s\.id/|linktr\.ee/|forms\.gle/|t\.me/)'
+    r'[^\s\)\]\,<>]{3,}'
+)
+
+def _ekstrak_url(teks: str) -> list:
+    urls = _URL_PATTERN.findall(teks)
+    urls = [re.sub(r'[.,!?)]+$', '', u) for u in urls]
+    return list(dict.fromkeys(urls))
+
+
+def _strip_emoji(teks: str) -> str:
+    return re.sub(r'[^\u0000-\u024F\u1E00-\u1EFF]', '', teks).strip()
+
+
+# =============================================================================
+# LLM - hanya ekstrak judul (semua sumber)
+# URL diekstrak pakai regex _ekstrak_url(), bukan LLM.
+# Payload disingkat (i/c/j) untuk hemat token.
 # =============================================================================
 def _llm_call(prompt: str) -> list:
     for attempt in range(3):
         try:
             raw = gemini_model.generate_content(prompt).text
-            print(f"[LLM] Raw response: {raw[:300]}")
+            print(f'[LLM] Raw: {raw[:200]}')
             return json.loads(raw)
         except Exception as e:
-            print(f"[LLM] Error attempt {attempt + 1}: {e}")
+            print(f'[LLM] Error attempt {attempt + 1}: {e}')
             time.sleep(15)
     return []
-
-
-def _strip_emoji(teks: str) -> str:
-    """Hapus semua emoji dan simbol non-ASCII dari string."""
-    return re.sub(r'[^\u0000-\u024F\u1E00-\u1EFF]', '', teks).strip()
 
 
 def proses_batch_dengan_gemini(data_batch: list) -> list:
     if not gemini_model or not data_batch:
         return data_batch
 
-    grup_web = [x for x in data_batch if "IG" not in x["sumber"]]
-    grup_ig  = [x for x in data_batch if "IG"     in x["sumber"]]
-
-    # llm_map: key = id (string), value = {judul, link_pendaftaran}
-    llm_map: dict = {}
-
-    if grup_web:
-        payload = [{"i": x["id"], "c": x["caption"][:400]} for x in grup_web]
-        instruksi = (
-            'Dari field c tiap item, temukan nama resmi lomba/kompetisi. '
-            'Nama lomba biasanya mengandung kata: Kompetisi, Lomba, Competition, Olympiad, Hackathon, Festival, Award, Call for. '
-            'WAJIB hapus semua emoji dan simbol dari hasil. Contoh: "🚀 Open Registration BMC 2026⭐" → "Open Registration BMC 2026". '
-            'Jika tidak ditemukan tulis "Tanpa Judul". '
-            'Output JSON Array. Format tiap item: {"i":"...","j":"..."}'
-        )
-        hasil = _llm_call(instruksi + "\n\nData: " + json.dumps(payload, ensure_ascii=False))
-        for row in hasil:
-            uid = str(row.get("i", ""))
-            llm_map[uid] = {
-                "judul": _strip_emoji(row.get("j", "")),
-                "link_pendaftaran": [],
-            }
-
-    if grup_ig:
-        payload = [{"i": x["id"], "c": x["caption"][:1000]} for x in grup_ig]
-        instruksi = (
-            'Dari field c tiap item ekstrak dua hal: '
-            '1) j: nama resmi lomba/kompetisi. WAJIB hapus semua emoji dan simbol. Contoh: "🚀 Open Registration BMC 2026⭐" → "Open Registration BMC 2026". Jika tidak ada tulis "Tanpa Judul". '
-            '2) l: array semua URL yang ada di caption (http/https/bit.ly/s.id/linktr.ee/forms.gle). Jika tidak ada URL tulis []. '
-            'Output JSON Array. Format tiap item: {"i":"...","j":"...","l":[]}'
-        )
-        hasil = _llm_call(instruksi + "\n\nData: " + json.dumps(payload, ensure_ascii=False))
-        for row in hasil:
-            uid = str(row.get("i", ""))
-            llm_map[uid] = {
-                "judul": _strip_emoji(row.get("j", "")),
-                "link_pendaftaran": list(dict.fromkeys(row.get("l", []))),
-            }
+    payload   = [{"i": x["id"], "c": x["caption"][:400]} for x in data_batch]
+    instruksi = (
+        "Dari field c tiap item, temukan nama resmi lomba/kompetisi. "
+        "WAJIB hapus semua emoji dan simbol dari hasil. "
+        'Contoh: "DIBUKA PENDAFTARAN OLIMPIADE PANDAWA 16 !!" -> "Olimpiade Pandawa 16". '
+        'Jika tidak ditemukan tulis "Tanpa Judul". '
+        'Output JSON Array. Format: {"i":"...","j":"..."}'
+    )
+    hasil   = _llm_call(instruksi + "\n\nData: " + json.dumps(payload, ensure_ascii=False))
+    llm_map = {str(row.get("i", "")): _strip_emoji(row.get("j", "")) for row in hasil}
 
     for item in data_batch:
-        llm = llm_map.get(str(item["id"]), {})  # pastikan key selalu string
-        if llm.get("judul"):
-            item["judul"] = llm["judul"]
+        judul_llm = llm_map.get(str(item["id"]), "")
+        if judul_llm:
+            item["judul"] = judul_llm
         if "IG" in item["sumber"]:
-            item["link_pendaftaran"] = llm.get("link_pendaftaran", [])
+            item["link_pendaftaran"] = _ekstrak_url(item["caption"])
 
     time.sleep(3)
     return data_batch
@@ -516,28 +500,27 @@ def reprocess_data_lama(collection) -> None:
     if not perlu_fix:
         return
 
-    # Proses per batch
+    # Proses per batch: judul via LLM, URL via regex
     BATCH_SIZE = 15
     for i in range(0, len(perlu_fix), BATCH_SIZE):
         batch = perlu_fix[i:i + BATCH_SIZE]
         print(f"[REPROCESS] Batch {i // BATCH_SIZE + 1} ({len(batch)} item)...")
 
-        payload = [{"i": d["id"], "c": d["caption"][:1000]} for d in batch]
+        payload   = [{"i": d["id"], "c": d["caption"][:400]} for d in batch]
         instruksi = (
-            'Dari field c tiap item ekstrak dua hal: '
-            '1) j: nama resmi lomba/kompetisi. WAJIB hapus semua emoji dan simbol. '
-            'Contoh: "\U0001f680 Open Registration BMC 2026\u2b50" \u2192 "Open Registration BMC 2026". Jika tidak ada tulis "Tanpa Judul". '
-            '2) l: array semua URL di caption (http/https/bit.ly/s.id/linktr.ee/forms.gle). Jika tidak ada tulis []. '
-            'Output JSON Array. Format tiap item: {"i":"...","j":"...","l":[]}'
+            "Dari field c tiap item, temukan nama resmi lomba/kompetisi. "
+            "WAJIB hapus semua emoji dan simbol dari hasil. "
+            'Contoh: "DIBUKA PENDAFTARAN OLIMPIADE PANDAWA 16 !!" -> "Olimpiade Pandawa 16". '
+            'Jika tidak ditemukan tulis "Tanpa Judul". '
+            'Output JSON Array. Format: {"i":"...","j":"..."}'
         )
-        hasil = _llm_call(instruksi + "\n\nData: " + json.dumps(payload, ensure_ascii=False))
-        llm_map = {str(row.get("i", "")): row for row in hasil}
+        hasil   = _llm_call(instruksi + "\n\nData: " + json.dumps(payload, ensure_ascii=False))
+        llm_map = {str(row.get("i", "")): _strip_emoji(row.get("j", "")) for row in hasil}
 
         ops = []
         for doc in batch:
-            llm = llm_map.get(str(doc["id"]), {})
-            judul_baru = _strip_emoji(llm.get("j", "")) or doc.get("judul", "")
-            links_baru = list(dict.fromkeys(llm.get("l", [])))
+            judul_baru = llm_map.get(str(doc["id"]), "") or doc.get("judul", "")
+            links_baru = _ekstrak_url(doc.get("caption", ""))  # regex, bukan LLM
             ops.append(UpdateOne(
                 {"id": doc["id"]},
                 {"$set": {"judul": judul_baru, "link_pendaftaran": links_baru}}
