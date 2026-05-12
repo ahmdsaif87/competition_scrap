@@ -490,6 +490,68 @@ def dedup_hasil(hasil_baru: list, data_di_db: list, threshold: float = 0.6) -> l
 
 
 # =============================================================================
+# REPROCESS — perbaiki data lama di DB yang judulnya masih ada emoji
+#             atau link_pendaftaran-nya kosong (khusus IG)
+# =============================================================================
+def reprocess_data_lama(collection) -> None:
+    """
+    Ambil dokumen dari DB yang perlu diperbaiki, proses ulang lewat LLM,
+    lalu update. Jalankan sekali untuk bersihkan data lama.
+    """
+    # Cari dokumen IG dengan link_pendaftaran kosong ATAU judul masih ada emoji
+    def ada_emoji(teks: str) -> bool:
+        return bool(re.search(r'[^\u0000-\u024F\u1E00-\u1EFF]', teks))
+
+    semua = list(collection.find(
+        {"sumber": {"$regex": "^IG"}},
+        {"id": 1, "sumber": 1, "judul": 1, "caption": 1, "link_pendaftaran": 1, "_id": 0}
+    ))
+
+    # Filter yang perlu diperbaiki
+    perlu_fix = [
+        d for d in semua
+        if not d.get("link_pendaftaran") or ada_emoji(d.get("judul", ""))
+    ]
+    print(f"[REPROCESS] {len(perlu_fix)} dokumen IG perlu diperbaiki.")
+    if not perlu_fix:
+        return
+
+    # Proses per batch
+    BATCH_SIZE = 15
+    for i in range(0, len(perlu_fix), BATCH_SIZE):
+        batch = perlu_fix[i:i + BATCH_SIZE]
+        print(f"[REPROCESS] Batch {i // BATCH_SIZE + 1} ({len(batch)} item)...")
+
+        payload = [{"i": d["id"], "c": d["caption"][:1000]} for d in batch]
+        instruksi = (
+            'Dari field c tiap item ekstrak dua hal: '
+            '1) j: nama resmi lomba/kompetisi. WAJIB hapus semua emoji dan simbol. '
+            'Contoh: "\U0001f680 Open Registration BMC 2026\u2b50" \u2192 "Open Registration BMC 2026". Jika tidak ada tulis "Tanpa Judul". '
+            '2) l: array semua URL di caption (http/https/bit.ly/s.id/linktr.ee/forms.gle). Jika tidak ada tulis []. '
+            'Output JSON Array. Format tiap item: {"i":"...","j":"...","l":[]}'
+        )
+        hasil = _llm_call(instruksi + "\n\nData: " + json.dumps(payload, ensure_ascii=False))
+        llm_map = {str(row.get("i", "")): row for row in hasil}
+
+        ops = []
+        for doc in batch:
+            llm = llm_map.get(str(doc["id"]), {})
+            judul_baru = _strip_emoji(llm.get("j", "")) or doc.get("judul", "")
+            links_baru = list(dict.fromkeys(llm.get("l", [])))
+            ops.append(UpdateOne(
+                {"id": doc["id"]},
+                {"$set": {"judul": judul_baru, "link_pendaftaran": links_baru}}
+            ))
+            print(f"  [{doc['id']}] judul: {judul_baru!r} | links: {links_baru}")
+
+        if ops:
+            collection.bulk_write(ops)
+        time.sleep(3)
+
+    print("[REPROCESS] Selesai.")
+
+
+# =============================================================================
 # MAIN
 # Fase 1: scrape paralel
 # Fase 2: LLM (judul semua sumber, link_pendaftaran IG)
@@ -504,6 +566,9 @@ async def main():
     data_di_db   = list(collection.find({}, {"id": 1, "link_direct": 1, "judul": 1, "_id": 0}))
     id_sudah_ada = {d["id"] for d in data_di_db if "id" in d}
     print(f"[INFO] {len(id_sudah_ada)} data sudah ada di DB.")
+
+    # Fase 0: perbaiki data lama yang judul/link-nya belum benar
+    reprocess_data_lama(collection)
 
     # Fase 1
     results = await asyncio.gather(
