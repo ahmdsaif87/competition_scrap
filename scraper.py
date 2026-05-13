@@ -1,5 +1,3 @@
-"""Competition scraper: infolomba.id, silomba.id, and Instagram."""
-
 from __future__ import annotations
 
 import asyncio
@@ -69,6 +67,12 @@ OPEN_REGISTRATION_RE = re.compile(
     r"open\s+registration\s*[:\-]\s*([^\]\n]+)", re.IGNORECASE
 )
 WHITESPACE_RE = re.compile(r"\s+")
+# Timeline pattern: matches date ranges like "23-24 Januari" or "23-28 Jan"
+TIMELINE_PATTERN = re.compile(
+    r"(?:pendaftaran|registration|open|close|pengumpulan|submission|deadline|tutup)\s*[:\-]?\s*"
+    r"(\d{1,2})\s*[-–]\s*(\d{1,2})\s+([a-zA-Z]+|[0-9]{1,2})",
+    re.IGNORECASE
+)
 
 # ---------------------------------------------------------------------------
 # Keyword sets
@@ -85,6 +89,22 @@ SOURCE_PRIORITY = {"infolomba.id": 0, "silomba.id": 1}
 
 TITLE_COMPETITION_WORDS = {"lomba", "competition", "olimpiade", "challenge", "contest"}
 TITLE_EVENT_WORDS = {"conference", "summit", "bootcamp", "program", "award"}
+
+# Month mapping for normalization
+MONTH_MAP = {
+    "januari": "Januari", "january": "Januari", "jan": "Januari",
+    "februari": "Februari", "february": "Februari", "feb": "Februari",
+    "maret": "Maret", "march": "Maret", "mar": "Maret",
+    "april": "April", "apr": "April",
+    "mei": "Mei", "may": "Mei",
+    "juni": "Juni", "june": "Juni", "jun": "Juni",
+    "juli": "Juli", "july": "Juli", "jul": "Juli",
+    "agustus": "Agustus", "august": "Agustus", "aug": "Agustus",
+    "september": "September", "sept": "September", "sep": "September",
+    "oktober": "Oktober", "october": "Oktober", "oct": "Oktober",
+    "november": "November", "nov": "November",
+    "desember": "Desember", "december": "Desember", "dec": "Desember",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +181,71 @@ def is_registration_context(text: str) -> bool:
 
 def is_non_registration_context(text: str) -> bool:
     return _keywords_in(text, NON_REGISTRATION_KEYWORDS)
+
+
+# ---------------------------------------------------------------------------
+# Timeline & Kategori extraction
+# ---------------------------------------------------------------------------
+
+def _normalize_month(month_str: str) -> str:
+    """Normalize bulan ke format Bulan penuh"""
+    return MONTH_MAP.get(month_str.lower().strip(), month_str)
+
+
+def extract_timeline(text: str) -> str:
+    """
+    Extract timeline dari teks dalam format 'dd-dd BulanNama'.
+    Cth: '23-28 Januari' dari 'Pendaftaran: 23-24 Januari, Pengumpulan: 27-28 Januari'
+    """
+    if not text:
+        return ""
+    
+    matches = []
+    for match in TIMELINE_PATTERN.finditer(text):
+        day_start, day_end, month = match.groups()
+        month_norm = _normalize_month(month)
+        matches.append((int(day_start), int(day_end), month_norm))
+    
+    if not matches:
+        return ""
+    
+    if len(matches) == 1:
+        start_day, end_day, month = matches[0]
+        return f"{start_day}-{end_day} {month}"
+    
+    # Jika ada 2+ matches (pendaftaran + pengumpulan), ambil range terluas
+    all_days = [day for d1, d2, _ in matches for day in [d1, d2]]
+    months = [month for _, _, month in matches]
+    
+    if len(set(months)) == 1:
+        # Sama bulan, ambil min-max hari
+        return f"{min(all_days)}-{max(all_days)} {months[0]}"
+    else:
+        # Beda bulan, ambil dari tanggal pertama sampai terakhir dengan bulan
+        first_day, _, first_month = matches[0]
+        _, last_day, last_month = matches[-1]
+        return f"{first_day} {first_month} - {last_day} {last_month}"
+
+
+def extract_kategori(text: str, title: str = "") -> str:
+    """
+    Extract kategori lomba dari teks dan judul.
+    Return salah satu: Kompetisi, Konferensi, Bootcamp, Program, Award, Lainnya
+    """
+    combined = f"{title} {text}".lower()
+    
+    if any(w in combined for w in ["kompetisi", "lomba", "competition", "contest", "challenge", "olimpiade"]):
+        return "Kompetisi"
+    elif any(w in combined for w in ["konferensi", "conference", "seminar", "workshop"]):
+        return "Konferensi"
+    elif any(w in combined for w in ["bootcamp", "training", "pelatihan", "kursus"]):
+        return "Bootcamp"
+    elif any(w in combined for w in ["program", "beasiswa", "scholarship", "magang"]):
+        return "Program"
+    elif any(w in combined for w in ["award", "penghargaan", "apresiasi"]):
+        return "Award"
+    else:
+        return "Lainnya"
 
 
 # ---------------------------------------------------------------------------
@@ -309,11 +394,13 @@ GEMINI_CLIENT = _create_gemini_client()
 
 _LLM_PROMPT_PREFIX = (
     "Rapikan data lomba untuk mahasiswa. Untuk setiap item, kembalikan JSON array "
-    'dengan format {"i":"id","j":"judul resmi","l":["url pendaftaran"]}. '
+    'dengan format {"i":"id","j":"judul resmi","l":["url pendaftaran"],"t":"timeline","k":"kategori"}. '
     "Judul harus berupa nama lomba/program/event saja, tanpa emoji, sapaan, label "
     "pendaftaran, tanggal, atau URL. Field l hanya berisi URL pendaftaran/register/apply, "
-    "bukan guidebook, kontak, sosial media, atau WhatsApp. Jika tidak yakin, pertahankan "
-    "judul/link yang sudah ada.\n\nData: "
+    "bukan guidebook, kontak, sosial media, atau WhatsApp. Field t adalah timeline gabungan "
+    "(cth: '23-28 Januari') dari tanggal awal sampai akhir, kosongkan jika tidak ada. "
+    "Field k adalah kategori lomba (Kompetisi/Konferensi/Bootcamp/Program/Award/Lainnya). "
+    "Jika tidak yakin, pertahankan data yang sudah ada atau isi dengan string kosong.\n\nData: "
 )
 
 
@@ -339,6 +426,14 @@ def process_batch_with_gemini(batch: list) -> list:
     if not GEMINI_CLIENT or not batch:
         return batch
 
+    # Pre-extract timeline dan kategori dari text untuk di-pass ke LLM
+    for item in batch:
+        caption = item.get("caption", "")
+        if not item.get("timeline"):
+            item["timeline"] = extract_timeline(caption)
+        if not item.get("kategori"):
+            item["kategori"] = extract_kategori(caption, item.get("judul", ""))
+
     payload = [
         {
             "i": item["id"],
@@ -346,6 +441,8 @@ def process_batch_with_gemini(batch: list) -> list:
             "judul": item.get("judul", ""),
             "caption": item.get("caption", "")[:1200],
             "link_pendaftaran": item.get("link_pendaftaran", []),
+            "timeline": item.get("timeline", ""),
+            "kategori": item.get("kategori", ""),
         }
         for item in batch
     ]
@@ -358,14 +455,22 @@ def process_batch_with_gemini(batch: list) -> list:
 
     for item in batch:
         row = llm_map.get(item["id"], {})
+        # Update judul jika LLM return yang lebih baik
         if row.get("j"):
             title = clean_title(row["j"])
             if title != "Tanpa Judul":
                 item["judul"] = title
+        # Update link jika LLM return yang lebih baik
         if row.get("l"):
             links = [u for raw in row["l"] if (u := clean_url(raw))]
             if links:
                 item["link_pendaftaran"] = list(dict.fromkeys(links))
+        # Update timeline dari LLM jika kosong
+        if row.get("t") and not item.get("timeline"):
+            item["timeline"] = row["t"]
+        # Update kategori dari LLM jika kosong
+        if row.get("k") and not item.get("kategori"):
+            item["kategori"] = row["k"]
 
     time.sleep(2)
     return batch
@@ -384,6 +489,8 @@ def _build_item(uid, source, title, poster, caption, links, direct_url) -> dict:
         "caption": caption,
         "link_pendaftaran": links,
         "link_direct": direct_url,
+        "timeline": extract_timeline(caption),
+        "kategori": extract_kategori(caption, title),
     }
 
 
@@ -616,9 +723,10 @@ def _scrape_ig_post(driver, url: str, account: str, seen_ids: set) -> dict | Non
         if og := driver.find_elements(By.XPATH, '//meta[@property="og:image"]'):
             poster = og[0].get_attribute("content") or ""
 
+    title = extract_title_from_caption(caption)
     return _build_item(
         uid, f"IG @{account}",
-        extract_title_from_caption(caption),
+        title,
         poster, caption,
         extract_registration_links(caption),
         url,
