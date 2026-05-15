@@ -1,4 +1,4 @@
-from future import annotations
+from __future__ import annotations
 import asyncio
 import hashlib
 import json
@@ -43,7 +43,8 @@ MAX_WEB_ITEMS = int(os.environ.get("MAX_WEB_ITEMS", "15"))
 MAX_IG_POSTS_PER_ACCOUNT = int(os.environ.get("MAX_IG_POSTS_PER_ACCOUNT", "6"))
 
 # --- Compiled Patterns & Constants ---
-URL_RE = re.compile(r"https?://[^\s<>'\"`\)\|\}\]]+", re.IGNORECASE)
+# Fixed syntax: Safe regex boundary to prevent bracket/quote clashes
+URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 INSTAGRAM_SHORTCODE_RE = re.compile(r"/(?:p|reel)/([^/?#]+)/?")
 WHITESPACE_RE = re.compile(r"\s+")
 GUIDEBOOK_KEYWORDS = {"guidebook", "panduan", "juknis", "ketentuan", "booklet", "syarat", "rulebook", "bit.ly/panduan", "bit.ly/juknis"}
@@ -52,7 +53,6 @@ FORM_HOSTS = {"forms.gle", "docs.google.com", "bit.ly", "s.id", "tinyurl.com", "
 BLOCKED_SOCIAL_HOSTS = {"instagram.com", "facebook.com", "twitter.com", "x.com", "youtube.com", "youtu.be", "tiktok.com", "wa.me", "api.whatsapp.com"}
 
 # --- LLM Prompt Configuration ---
-# Instructions to summarize, clean titles, and extract specific metadata
 _LLM_PROMPT_PREFIX = (
     "Extract and clean competition data for students. Return a JSON array of objects. "
     "Required Format: "
@@ -75,7 +75,9 @@ def make_id(title: str, source: str) -> str:
 
 def clean_url(url: str, base_url: str = "") -> str:
     if not url: return ""
-    url = url.strip().strip(".,;:!?"')]}")
+    # Fixed syntax: properly escaped double quote inside the string literal
+    url = url.strip().strip(".,;:!?\"')]}")
+    
     if url.startswith("//"): url = "https:" + url
     elif base_url and url.startswith("/"): url = urljoin(base_url, url)
     return url if url.startswith(("http://", "https://")) else ""
@@ -85,7 +87,8 @@ def normalize_space(text: str) -> str:
 
 def strip_noise(text: str) -> str:
     text = "".join(ch if unicodedata.category(ch)[0] != "S" else " " for ch in (text or ""))
-    return normalize_space(re.sub(r'[@#*_>|"""'']+', " ", text))
+    # Fixed syntax: properly escaped quotes inside raw string regex
+    return normalize_space(re.sub(r"[@#*_>|\"']+", " ", text))
 
 def is_mahasiswa(text: str) -> bool:
     lower = (text or "").lower()
@@ -93,7 +96,6 @@ def is_mahasiswa(text: str) -> bool:
 
 # --- Link Extraction Logic ---
 def extract_registration_links(text: str, anchors: list[dict] = None) -> list[str]:
-    # Filters out guidebook and social links to find actual registration forms
     anchors = anchors or []
     found, seen = [], set()
     
@@ -110,7 +112,6 @@ def extract_registration_links(text: str, anchors: list[dict] = None) -> list[st
         url = clean_url(raw)
         if not url or url in seen or any(h in url.lower() for h in BLOCKED_SOCIAL_HOSTS):
             continue
-        # Exclude links that likely point to documentation
         if any(kw in url.lower() for kw in GUIDEBOOK_KEYWORDS):
             continue
         
@@ -138,7 +139,6 @@ def _create_gemini_client():
 GEMINI_CLIENT = _create_gemini_client()
 
 def process_batch_with_gemini(batch: list) -> list:
-    # Uses AI to summarize captions and enhance metadata accuracy
     if not GEMINI_CLIENT or not batch: return batch
     
     payload = [{"i": item["id"], "text": item["caption"][:1500], "title": item["judul"]} for item in batch]
@@ -168,7 +168,6 @@ def process_batch_with_gemini(batch: list) -> list:
 
 # --- Scrapers ---
 def scrape_infolomba(seen_ids: set) -> list:
-    # Scrapes infolomba.id website using cloudscraper
     base = "https://infolomba.id"
     scraper = cloudscraper.create_scraper()
     results = []
@@ -200,7 +199,6 @@ def scrape_infolomba(seen_ids: set) -> list:
     return results
 
 async def scrape_silomba(seen_ids: set) -> list:
-    # Scrapes silomba.id using Playwright for dynamic content
     base = "https://silomba.id"
     results = []
     async with async_playwright() as p:
@@ -235,7 +233,6 @@ async def scrape_silomba(seen_ids: set) -> list:
     return results
 
 def scrape_instagram(seen_ids: set) -> list:
-    # Scrapes Instagram accounts using Selenium and session cookie
     if not IG_SESSION_ID: return []
     results = []
     opts = Options()
@@ -285,11 +282,9 @@ async def main():
     client = pymongo.MongoClient(MONGO_URI)
     col = client[DB_NAME][COLLECTION]
     
-    # Load existing IDs to avoid duplicates
     db_data = list(col.find({}, {"id": 1}))
     seen_ids = {d["id"] for d in db_data}
     
-    # Run scrapers
     web_data, silomba_data, ig_data = await asyncio.gather(
         asyncio.to_thread(scrape_infolomba, seen_ids),
         scrape_silomba(seen_ids),
@@ -301,13 +296,11 @@ async def main():
         client.close()
         return
 
-    # Process in batches for LLM optimization
     final_data = []
     for i in range(0, len(raw_items), 10):
         batch = raw_items[i:i+10]
         final_data.extend(process_batch_with_gemini(batch))
 
-    # Save to Database
     if final_data:
         ops = [UpdateOne({"id": item["id"]}, {"$set": item}, upsert=True) for item in final_data]
         col.bulk_write(ops)
