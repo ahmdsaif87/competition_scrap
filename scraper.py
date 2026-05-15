@@ -43,29 +43,25 @@ MAX_WEB_ITEMS = int(os.environ.get("MAX_WEB_ITEMS", "15"))
 MAX_IG_POSTS_PER_ACCOUNT = int(os.environ.get("MAX_IG_POSTS_PER_ACCOUNT", "6"))
 
 # --- Compiled Patterns & Constants ---
-# Fixed syntax: Safe regex boundary to prevent bracket/quote clashes
-URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
-INSTAGRAM_SHORTCODE_RE = re.compile(r"/(?:p|reel)/([^/?#]+)/?")
+# Support standard URLs and shortlinks even without http/https schema
+URL_RE = re.compile(r"(?:https?://[^\s<>\"']+)|(?:(?:bit\.ly|heylink\.me|s\.id|lynk\.id|linktr\.ee|forms\.gle|taplink\.cc)/[^\s<>\"']+)", re.IGNORECASE)
 WHITESPACE_RE = re.compile(r"\s+")
 GUIDEBOOK_KEYWORDS = {"guidebook", "panduan", "juknis", "ketentuan", "booklet", "syarat", "rulebook", "bit.ly/panduan", "bit.ly/juknis"}
 MAHASISWA_KEYWORDS = {"mahasiswa", "universitas", "kampus", "s1", "d3", "d4", "umum", "undergraduate", "diploma", "student"}
-FORM_HOSTS = {"forms.gle", "docs.google.com", "bit.ly", "s.id", "tinyurl.com", "lynk.id"}
 BLOCKED_SOCIAL_HOSTS = {"instagram.com", "facebook.com", "twitter.com", "x.com", "youtube.com", "youtu.be", "tiktok.com", "wa.me", "api.whatsapp.com"}
 
 # --- LLM Prompt Configuration ---
 _LLM_PROMPT_PREFIX = (
-    "Extract and clean competition data for students. Return a JSON array of objects. "
-    "Required Format: "
-    '{"i":"id","j":"enhanced_title","c":"summarized_caption","l":["reg_links_only"],"d":"deadline","p":"prizepool","t":"topic","o":"organizer"}. '
-    "\nRules: "
-    "\n- j: Professional title only. Remove 'Open Registration', emojis, and dates."
-    "\n- c: Regenerate the caption to include only essential info (what, who, when) in 3-4 sentences."
-    "\n- l: Strictly registration/apply links. Remove guidebook, rules, or WhatsApp links."
-    "\n- d: Extract specific closing date (DD MMMM YYYY). Use '-' if unknown."
-    "\n- p: Total prize pool amount (e.g., Rp 5.000.000). Use '-' if unknown."
-    "\n- t: Category (IT/Bisnis/Webdev/Design/Poster/Data/Mobile/Game/Multimedia/IoT/Robotics/Lainnya)."
-    "\n- o: The organizing institution or community name."
-    "\n\nData: "
+    "Ekstrak data lomba ke JSON array: "
+    '[{"i":"id","j":"judul_bersih","c":"caption","l":["link_daftar"],"d":"deadline","p":"prizepool","t":"topik","o":"penyelenggara"}]'
+    "\nAturan:"
+    "\n- c: Ringkas info (event, target peserta, benefit) MAKS 3 kalimat padat."
+    "\n- l: HANYA link form (bit.ly, gform, heylink). Abaikan link WA/Juknis."
+    "\n- t: Kategori (IT/Bisnis/Design/Poster/Data/Mobile/Game/Multimedia/IoT/Robotics/Sastra/Seni/Lainnya)."
+    "\n- d: Tgl penutupan (DD MMMM YYYY) atau '-'."
+    "\n- p: Total nominal hadiah atau '-'."
+    "\n- j: Nama lomba saja, buang emoji/sapaan/tanggal."
+    "\nInput:\n"
 )
 
 # --- Utility Helpers ---
@@ -75,11 +71,16 @@ def make_id(title: str, source: str) -> str:
 
 def clean_url(url: str, base_url: str = "") -> str:
     if not url: return ""
-    # Fixed syntax: properly escaped double quote inside the string literal
     url = url.strip().strip(".,;:!?\"')]}")
     
-    if url.startswith("//"): url = "https:" + url
-    elif base_url and url.startswith("/"): url = urljoin(base_url, url)
+    if not url.startswith("http"):
+        if url.startswith("//"): 
+            url = "https:" + url
+        elif base_url and url.startswith("/"): 
+            url = urljoin(base_url, url)
+        else:
+            url = "https://" + url 
+            
     return url if url.startswith(("http://", "https://")) else ""
 
 def normalize_space(text: str) -> str:
@@ -87,12 +88,32 @@ def normalize_space(text: str) -> str:
 
 def strip_noise(text: str) -> str:
     text = "".join(ch if unicodedata.category(ch)[0] != "S" else " " for ch in (text or ""))
-    # Fixed syntax: properly escaped quotes inside raw string regex
     return normalize_space(re.sub(r"[@#*_>|\"']+", " ", text))
 
 def is_mahasiswa(text: str) -> bool:
     lower = (text or "").lower()
     return any(kw in lower for kw in MAHASISWA_KEYWORDS)
+
+def compress_text_for_llm(text: str) -> str:
+    # Token diet: Remove hashtags and standard social media call-to-actions
+    text = re.sub(r'#\w+', '', text)
+    noise_patterns = r'(?i)(silomba hanya media|jangan lupa follow|tag teman|klik link di bio|share postingan ini|bantu sebar|info lebih lanjut hubungi).*'
+    text = re.sub(noise_patterns, '', text)
+    text = strip_noise(text)
+    # Core event info is usually in the first 800 characters
+    return text[:800]
+
+def safe_extract_json(text: str) -> list:
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\[.*\]", text, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except Exception:
+                pass
+    return []
 
 # --- Link Extraction Logic ---
 def extract_registration_links(text: str, anchors: list[dict] = None) -> list[str]:
@@ -141,17 +162,25 @@ GEMINI_CLIENT = _create_gemini_client()
 def process_batch_with_gemini(batch: list) -> list:
     if not GEMINI_CLIENT or not batch: return batch
     
-    payload = [{"i": item["id"], "text": item["caption"][:1500], "title": item["judul"]} for item in batch]
+    payload = [
+        {
+            "i": item["id"], 
+            "text": compress_text_for_llm(item["caption"]), 
+            "title": item["judul"]
+        } 
+        for item in batch
+    ]
     
     try:
         response = GEMINI_CLIENT.models.generate_content(
             model="gemini-2.0-flash-lite",
-            contents=_LLM_PROMPT_PREFIX + json.dumps(payload),
-            config=genai_types.GenerateContentConfig(response_mime_type="application/json")
+            # separators=(',', ':') removes whitespace to save tokens
+            contents=_LLM_PROMPT_PREFIX + json.dumps(payload, separators=(',', ':')),
         )
-        llm_results = json.loads(response.text)
+        llm_results = safe_extract_json(response.text)
         llm_map = {str(r["i"]): r for r in llm_results if isinstance(r, dict)}
-    except Exception:
+    except Exception as e:
+        print(f"LLM Error: {e}")
         return batch
 
     for item in batch:
@@ -162,7 +191,7 @@ def process_batch_with_gemini(batch: list) -> list:
             item["link_pendaftaran"] = data.get("l", item["link_pendaftaran"])
             item["deadline_pendaftaran"] = data.get("d", "-")
             item["prizepool"] = data.get("p", "-")
-            item["topik"] = data.get("t", "Lainnya")
+            item["topik"] = data.get("t", "Lainnya") 
             item["penyelenggara"] = data.get("o", "Unknown")
     return batch
 
@@ -179,7 +208,11 @@ def scrape_infolomba(seen_ids: set) -> list:
         for link in list(links)[:MAX_WEB_ITEMS]:
             res = scraper.get(link, timeout=30)
             dsoup = BeautifulSoup(res.text, "html.parser")
-            text = dsoup.get_text("\n")
+            
+            # Isolate article content to avoid menu and footer elements
+            content_div = dsoup.find("div", class_="entry-content") or dsoup.find("article")
+            text = content_div.get_text("\n") if content_div else dsoup.get_text("\n")
+
             if not is_mahasiswa(text): continue
             
             title = strip_noise(dsoup.find("h1").get_text() if dsoup.find("h1") else link)
@@ -191,7 +224,7 @@ def scrape_infolomba(seen_ids: set) -> list:
                 "sumber": "infolomba.id",
                 "judul": title,
                 "poster": best_poster_from_soup(dsoup, base),
-                "caption": text[:2000],
+                "caption": text.strip()[:2000],
                 "link_pendaftaran": extract_registration_links(text),
                 "link_direct": link
             })
@@ -213,7 +246,16 @@ async def scrape_silomba(seen_ids: set) -> list:
                 href = urljoin(base, card["href"])
                 await page.goto(href, wait_until="networkidle")
                 dsoup = BeautifulSoup(await page.content(), "html.parser")
-                text = dsoup.get_text("\n")
+                
+                # Isolate the exact description text
+                full_text = dsoup.get_text("\n")
+                clean_text = full_text
+                if "Deskripsi Lomba" in full_text:
+                    clean_text = full_text.split("Deskripsi Lomba")[-1]
+                    if "Silomba hanya media" in clean_text:
+                        clean_text = clean_text.split("Silomba hanya media")[0]
+                
+                if not is_mahasiswa(clean_text): continue
                 
                 title = strip_noise(dsoup.find("h1").get_text() if dsoup.find("h1") else "Lomba")
                 uid = make_id(title, "silomba.id")
@@ -224,8 +266,8 @@ async def scrape_silomba(seen_ids: set) -> list:
                     "sumber": "silomba.id",
                     "judul": title,
                     "poster": best_poster_from_soup(dsoup, base),
-                    "caption": text[:2000],
-                    "link_pendaftaran": extract_registration_links(text),
+                    "caption": clean_text.strip()[:2000],
+                    "link_pendaftaran": extract_registration_links(clean_text),
                     "link_direct": href
                 })
         except Exception as e: print(f"silomba error: {e}")
@@ -247,21 +289,37 @@ def scrape_instagram(seen_ids: set) -> list:
         for acc in IG_ACCOUNTS:
             driver.get(f"https://www.instagram.com/{acc}/")
             time.sleep(5)
-            links = [e.get_attribute("href") for e in driver.find_elements(By.CSS_SELECTOR, "a[href*='/p/'], a[href*='/reel/']")]
+            
+            elems = driver.find_elements(By.CSS_SELECTOR, "a[href*='/p/'], a[href*='/reel/']")
+            links = [e.get_attribute("href") for e in elems if e.get_attribute("href")]
             
             for url in links[:MAX_IG_POSTS_PER_ACCOUNT]:
                 driver.get(url)
                 time.sleep(4)
+                
                 caption = ""
-                if h1s := driver.find_elements(By.TAG_NAME, "h1"): caption = h1s[0].text
+                try:
+                    h1s = driver.find_elements(By.TAG_NAME, "h1")
+                    if h1s: caption = h1s[0].text
+                except Exception:
+                    pass
                 
                 if not is_mahasiswa(caption): continue
-                uid = make_id(url.split("/")[-2], f"IG_{acc}")
+                
+                try:
+                    shortcode = url.rstrip('/').split('/')[-1]
+                    uid = make_id(shortcode, f"IG_{acc}")
+                except Exception:
+                    continue
+                    
                 if uid in seen_ids: continue
 
                 poster = ""
-                if imgs := driver.find_elements(By.CSS_SELECTOR, "article img"):
-                    poster = imgs[0].get_attribute("src")
+                try:
+                    if imgs := driver.find_elements(By.CSS_SELECTOR, "article img"):
+                        poster = imgs[0].get_attribute("src")
+                except Exception:
+                    pass
 
                 results.append({
                     "id": uid,
@@ -272,8 +330,10 @@ def scrape_instagram(seen_ids: set) -> list:
                     "link_pendaftaran": extract_registration_links(caption),
                     "link_direct": url
                 })
-    except Exception as e: print(f"IG error: {e}")
-    finally: driver.quit()
+    except Exception as e: 
+        print(f"IG error: {e}")
+    finally: 
+        driver.quit()
     return results
 
 # --- Main Logic ---
@@ -297,6 +357,7 @@ async def main():
         return
 
     final_data = []
+    # Batch items to fit comfortably in LLM context limits
     for i in range(0, len(raw_items), 10):
         batch = raw_items[i:i+10]
         final_data.extend(process_batch_with_gemini(batch))
