@@ -17,7 +17,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip' # Mempercepat instalasi dependencies selanjutnya
+          cache: 'pip'
 
       - name: Install Python dependencies
         run: |
@@ -26,30 +26,6 @@ jobs:
       - name: Install Playwright browsers
         run: playwright install chromium && playwright install-deps
         
-      - name: Install Chrome for Selenium
-        run: |
-          wget -q https://storage.googleapis.com/chrome-for-testing-public/120.0.6099.109/linux64/chrome-linux64.zip
-          wget -q https://storage.googleapis.com/chrome-for-testing-public/120.0.6099.109/linux64/chromedriver-linux64.zip
-          unzip -q chrome-linux64.zip && unzip -q chromedriver-linux64.zip
-          sudo mv chrome-linux64 /opt/chrome
-          sudo mv chromedriver-linux64/chromedriver /usr/bin/chromedriver
-          sudo chmod +x /usr/bin/chromedriver /opt/chrome/chrome
-          sudo apt-get install -y \
-            libatk1.0-0 \
-            libatk-bridge2.0-0 \
-            libcups2 \
-            libdrm2 \
-            libxkbcommon0 \
-            libxcomposite1 \
-            libxdamage1 \
-            libxfixes3 \
-            libxrandr2 \
-            libgbm1 \
-            libpango-1.0-0 \
-            libnspr4 \
-            libnss3 \
-            libasound2t64 || sudo apt-get install -y libasound2
-
       - name: Run scraper to MongoDB
         env:
           IG_SESSION_ID: ${{ secrets.IG_SESSION_ID }}
