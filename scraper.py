@@ -43,7 +43,7 @@ MAX_WEB_ITEMS = int(os.environ.get("MAX_WEB_ITEMS", "15"))
 MAX_IG_POSTS_PER_ACCOUNT = int(os.environ.get("MAX_IG_POSTS_PER_ACCOUNT", "6"))
 
 # --- Compiled Patterns & Constants ---
-URL_RE = re.compile(r"https?://[^\s<>'"`)]}]+", re.IGNORECASE)
+URL_RE = re.compile(r"https?://[^\s<>'\"`\)\|\}\]]+", re.IGNORECASE)
 INSTAGRAM_SHORTCODE_RE = re.compile(r"/(?:p|reel)/([^/?#]+)/?")
 WHITESPACE_RE = re.compile(r"\s+")
 GUIDEBOOK_KEYWORDS = {"guidebook", "panduan", "juknis", "ketentuan", "booklet", "syarat", "rulebook", "bit.ly/panduan", "bit.ly/juknis"}
