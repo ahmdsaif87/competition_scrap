@@ -24,167 +24,156 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 
-# ============================================================================
-# CONFIG
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 
+IG_SESSION_ID = os.environ.get("IG_SESSION_ID", "")
 MONGO_URI = os.environ.get("MONGO_URI")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 DB_NAME = os.environ.get("DB_NAME", "competition_scraper")
 COLLECTION = os.environ.get("COLLECTION", "competition")
-
+IG_ACCOUNTS = [
+    a.strip()
+    for a in os.environ.get("IG_ACCOUNTS", "infolomba,infolomba_gratis,infolomba.olimpiade").split(",")
+    if a.strip()
+]
 MAX_WEB_ITEMS = int(os.environ.get("MAX_WEB_ITEMS", "15"))
+MAX_IG_POSTS_PER_ACCOUNT = int(os.environ.get("MAX_IG_POSTS_PER_ACCOUNT", "6"))
 
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0 Safari/537.36"
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
     )
 }
 
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-
-
-# ============================================================================
-# REGEX
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Compiled patterns
+# ---------------------------------------------------------------------------
 
 URL_RE = re.compile(r"https?://[^\s<>'\"`)\]}]+", re.IGNORECASE)
-
+INSTAGRAM_SHORTCODE_RE = re.compile(r"/(?:p|reel)/([^/?#]+)/?")
 TITLE_PREFIX_RE = re.compile(
-    r"^\s*(?:judul|title|nama\s+lomba|competition|event)\s*[:-]\s*",
-    re.IGNORECASE,
+    r"^\s*(?:judul|title|nama\s+lomba|competition|event)\s*[:\-]\s*", re.IGNORECASE
 )
-
+OPEN_REGISTRATION_RE = re.compile(
+    r"open\s+registration\s*[:\-]\s*([^\]\n]+)", re.IGNORECASE
+)
 WHITESPACE_RE = re.compile(r"\s+")
 
-DEADLINE_PATTERN = re.compile(
-    r"(?:deadline|tutup|close|akhir|until|hingga|s\.d\.|sd)\s*[:-]?\s*"
-    r"(\d{1,2})\s+([a-zA-Z]+)\s+(\d{4})?",
-    re.IGNORECASE,
+TIMELINE_PATTERN = re.compile(
+    r"(?:pendaftaran|registration|open|close|pengumpulan|submission|deadline|tutup|tanggal|date|mulai|start|akhir|end)?\s*[:\-]?\s*"
+    r"(\d{1,2})\s*[-–—]\s*(\d{1,2})\s+([a-zA-Z]+)",
+    re.IGNORECASE
 )
 
+SINGLE_DATE_PATTERN = re.compile(
+    r"(?:pendaftaran|registration|open|close|pengumpulan|submission|deadline|tutup|tanggal|date|mulai|start|akhir|end)?\s*[:\-]?\s*"
+    r"(\d{1,2})\s+([a-zA-Z]+)",
+    re.IGNORECASE
+)
 
-# ============================================================================
-# KEYWORDS
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Keyword sets
+# ---------------------------------------------------------------------------
 
-MAHASISWA_KEYWORDS = {
-    "mahasiswa",
-    "mahasiswi",
-    "universitas",
-    "kampus",
-    "s1",
-    "d3",
-    "d4",
-    "student",
-    "university",
-}
-
-FORM_HOSTS = {
-    "forms.gle",
-    "docs.google.com",
-    "bit.ly",
-    "s.id",
-    "tinyurl.com",
-    "lynk.id",
-}
-
-DEDUP_STOPWORDS = {
-    "the",
-    "of",
-    "and",
-    "in",
-    "on",
-    "at",
-    "to",
-    "a",
-    "an",
-    "di",
-    "ke",
-    "se",
-    "dan",
-    "atau",
-    "untuk",
-}
-
-MONTH_MAP = {
-    "januari": "Januari",
-    "january": "Januari",
-    "jan": "Januari",
-    "februari": "Februari",
-    "february": "Februari",
-    "feb": "Februari",
-    "maret": "Maret",
-    "march": "Maret",
-    "mar": "Maret",
-    "april": "April",
-    "mei": "Mei",
-    "may": "Mei",
-    "juni": "Juni",
-    "july": "Juli",
-    "juli": "Juli",
-    "august": "Agustus",
-    "agustus": "Agustus",
-    "september": "September",
-    "oktober": "Oktober",
-    "november": "November",
-    "desember": "Desember",
-}
+REGISTRATION_KEYWORDS = {"daftar", "pendaftaran", "register", "registrasi", "registration", "apply", "submission", "submit"}
+NON_REGISTRATION_KEYWORDS = {"guidebook", "booklet", "juknis", "contact", "kontak", "whatsapp", "wa.me", "cp", "narahubung", "email", "instagram", "tiktok", "youtube"}
+TITLE_NOISE_KEYWORDS = {"link pendaftaran", "pendaftaran", "register", "registration", "apply now", "guidebook", "contact us", "whatsapp", "deadline", "benefit", "prize", "hadiah", "timeline", "save the date", "open registration", "closed registration", "terbuka untuk", "untuk mahasiswa"}
+MAHASISWA_KEYWORDS = {"mahasiswa", "mahasiswi", "universitas", "kampus", "s1", "d3", "d4", "umum", "undergraduate", "diploma", "student", "university"}
+BLOCKED_SOCIAL_HOSTS = {"instagram.com", "facebook.com", "twitter.com", "x.com", "youtube.com", "youtu.be", "tiktok.com", "wa.me", "api.whatsapp.com"}
+FORM_HOSTS = {"forms.gle", "docs.google.com", "bit.ly", "s.id", "tinyurl.com", "lynk.id"}
+DEDUP_STOPWORDS = {"the", "of", "and", "in", "on", "at", "to", "a", "an", "di", "ke", "se", "dan", "atau", "untuk", "dengan", "dalam", "dari", "oleh", "yang", "adalah", "ini", "itu"}
+SOURCE_PRIORITY = {"infolomba.id": 0, "silomba.id": 1}
 
 KATEGORI_KEYWORDS = {
     "IT": {
-        "keywords": {
-            "programming",
-            "coding",
-            "developer",
-            "software",
-            "backend",
-            "frontend",
-            "fullstack",
-            "python",
-            "javascript",
-            "java",
-        },
-        "priority": 1,
+        "keywords": {"it", "programming", "coding", "developer", "web", "app", "software", "database", 
+                     "ai", "machine learning", "data science", "backend", "frontend", "fullstack",
+                     "python", "javascript", "java", "c++", "php", "golang", "rust", "cloud",
+                     "aws", "azure", "gcp", "devops", "cybersecurity", "hacking", "ctf",
+                     "pemrograman", "coding", "programmer", "kode", "sistem", "jaringan"},
+        "priority": 1
+    },
+    "Bisnis": {
+        "keywords": {"bisnis", "business", "entrepreneurship", "startup", "pitch", "investor",
+                     "kewirausahaan", "wirausaha", "marketing", "finance", "accounting", "sales",
+                     "business plan", "investor pitch", "venture", "unicorn"},
+        "priority": 2
     },
     "Webdev": {
-        "keywords": {
-            "web",
-            "webdev",
-            "react",
-            "vue",
-            "html",
-            "css",
-        },
-        "priority": 1,
+        "keywords": {"webdev", "web development", "web design", "frontend", "backend", "fullstack",
+                     "responsive", "ui", "ux", "html", "css", "javascript", "react", "vue",
+                     "angular", "web development", "web designer", "web developer"},
+        "priority": 1
     },
     "Design": {
-        "keywords": {
-            "design",
-            "ui",
-            "ux",
-            "figma",
-            "poster",
-        },
-        "priority": 2,
+        "keywords": {"design", "graphic design", "ui design", "ux design", "illustration", "motion",
+                     "visual", "branding", "logo", "desain", "grafis", "illustration",
+                     "figma", "photoshop", "adobe", "art", "creative"},
+        "priority": 3
+    },
+    "Poster": {
+        "keywords": {"poster", "infografis", "infographic", "visual design", "graphic",
+                     "desain poster", "kreativitas visual"},
+        "priority": 3
+    },
+    "Data": {
+        "keywords": {"data", "data science", "data analytics", "machine learning", "ml",
+                     "big data", "analytics", "tableau", "power bi", "sql", "statistik",
+                     "data analyst", "data engineer"},
+        "priority": 2
+    },
+    "Mobile": {
+        "keywords": {"mobile", "app development", "android", "ios", "flutter", "react native",
+                     "aplikasi mobile", "smartphone", "iphone", "android app"},
+        "priority": 2
+    },
+    "Game": {
+        "keywords": {"game", "gaming", "game development", "unity", "unreal", "game design",
+                     "esports", "kompetisi game", "game dev"},
+        "priority": 2
+    },
+    "Multimedia": {
+        "keywords": {"multimedia", "video", "editing", "audio", "animation", "motion graphic",
+                     "film", "cinematography", "produksi video", "premiere", "after effects"},
+        "priority": 3
+    },
+    "IoT": {
+        "keywords": {"iot", "internet of things", "embedded", "microcontroller", "arduino",
+                     "raspberry", "iot project", "sensor", "robotics"},
+        "priority": 2
+    },
+    "Robotics": {
+        "keywords": {"robotics", "robot", "robotika", "automation", "mekatronika", "engineering"},
+        "priority": 2
     },
 }
 
+MONTH_MAP = {
+    "januari": "Januari", "january": "Januari", "jan": "Januari",
+    "februari": "Februari", "february": "Februari", "feb": "Februari",
+    "maret": "Maret", "march": "Maret", "mar": "Maret",
+    "april": "April", "apr": "April",
+    "mei": "Mei", "may": "Mei",
+    "juni": "Juni", "june": "Juni", "jun": "Juni",
+    "juli": "Juli", "july": "Juli", "jul": "Juli",
+    "agustus": "Agustus", "august": "Agustus", "aug": "Agustus",
+    "september": "September", "sept": "September", "sep": "September",
+    "oktober": "Oktober", "october": "Oktober", "oct": "Oktober",
+    "november": "November", "nov": "November",
+    "desember": "Desember", "december": "Desember", "dec": "Desember",
+}
 
-# ============================================================================
-# HELPERS
-# ============================================================================
+
+# ---------------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------------
 
 def make_id(title: str, source: str) -> str:
-    raw = f"{source}_{title}".lower().strip()
-    return hashlib.md5(raw.encode()).hexdigest()[:12]
-
-
-def normalize_space(text: str) -> str:
-    return WHITESPACE_RE.sub(" ", text or "").strip()
+    normalized = f"{source}_{title}".lower().strip()
+    return hashlib.md5(normalized.encode()).hexdigest()[:12]
 
 
 def is_mahasiswa(text: str) -> bool:
@@ -192,37 +181,35 @@ def is_mahasiswa(text: str) -> bool:
     return any(kw in lower for kw in MAHASISWA_KEYWORDS)
 
 
+def normalize_space(text: str) -> str:
+    return WHITESPACE_RE.sub(" ", text or "").strip()
+
+
 def clean_url(url: str, base_url: str = "") -> str:
     if not url:
         return ""
-
-    url = url.strip().strip(".,;:!?'\")]}")
-    
+    url = url.strip().strip(".,;:!?\"'`)]}")
     if url.startswith("//"):
         url = "https:" + url
     elif base_url and url.startswith("/"):
         url = urljoin(base_url, url)
-
     return url if url.startswith(("http://", "https://")) else ""
 
 
-def strip_emoji(text: str) -> str:
+def strip_emoji_and_symbols(text: str) -> str:
     return "".join(
-        " "
-        if (
-            unicodedata.category(ch).startswith("S")
-            and ch not in {"&", "+", "#"}
-        )
-        else ch
+        " " if (unicodedata.category(ch).startswith("S") and ch not in {"&", "+", "#"}) else ch
         for ch in (text or "")
     )
 
 
 def clean_title(text: str) -> str:
-    text = strip_emoji(text)
+    text = strip_emoji_and_symbols(text)
     text = TITLE_PREFIX_RE.sub("", text)
     text = re.sub(r"https?://\S+", " ", text)
-    text = re.sub(r"[@#*_>|\"']+", " ", text)
+    text = re.sub(r'[@#*_`>|"""\'\']+', " ", text)
+    text = re.sub(r"\b(?:caption|repost|info lomba|infolomba)\b", " ", text, flags=re.I)
+    text = re.sub(r"\s*[-–—|:]\s*(?:open registration|registration|pendaftaran).*$", "", text, flags=re.I)
     return normalize_space(text)[:140].strip(" -:|") or "Tanpa Judul"
 
 
@@ -231,505 +218,812 @@ def safe_json_loads(text: str) -> list:
         return json.loads(text)
     except Exception:
         match = re.search(r"\[.*\]", text or "", re.S)
-
         if match:
             try:
                 return json.loads(match.group(0))
             except Exception:
                 pass
-
     return []
 
 
-def extract_deadline(text: str) -> str:
+def is_low_value_url(url: str) -> bool:
+    return urlparse(url).netloc.lower() in BLOCKED_SOCIAL_HOSTS
+
+
+def _keywords_in(text: str, keywords: set) -> bool:
+    lower = (text or "").lower()
+    return any(kw in lower for kw in keywords)
+
+
+def is_registration_context(text: str) -> bool:
+    return _keywords_in(text, REGISTRATION_KEYWORDS)
+
+
+def is_non_registration_context(text: str) -> bool:
+    return _keywords_in(text, NON_REGISTRATION_KEYWORDS)
+
+
+# ---------------------------------------------------------------------------
+# Timeline & Kategori extraction (IMPROVED)
+# ---------------------------------------------------------------------------
+
+def _normalize_month(month_str: str) -> str:
+    """Normalize bulan ke format Bulan penuh"""
+    return MONTH_MAP.get(month_str.lower().strip(), month_str)
+
+
+def extract_timeline(text: str) -> str:
+    """
+    Extract timeline dari teks dengan berbagai format:
+    - Range: "23-24 Januari", "23-28 Jan"
+    - Single: "23 Januari"
+    - Context: "Pendaftaran: 23-24 Januari"
+    
+    Returns format: "dd-dd BulanNama" atau "dd BulanNama - dd BulanNama"
+    """
     if not text:
         return ""
-
-    match = DEADLINE_PATTERN.search(text)
-
-    if not match:
-        return ""
-
-    day, month, year = match.groups()
-
-    month_norm = MONTH_MAP.get(month.lower(), month)
-
-    return f"{day} {month_norm}" + (f" {year}" if year else "")
+    
+    # Coba ekstrak range dahulu
+    range_matches = []
+    for match in TIMELINE_PATTERN.finditer(text):
+        day_start, day_end, month = match.groups()
+        try:
+            month_norm = _normalize_month(month)
+            range_matches.append({
+                "type": "range",
+                "start_day": int(day_start),
+                "end_day": int(day_end),
+                "month": month_norm,
+                "start_pos": match.start()
+            })
+        except:
+            pass
+    
+    if range_matches:
+        range_matches.sort(key=lambda x: x["start_pos"])
+        first = range_matches[0]
+        
+        all_months = set(m["month"] for m in range_matches)
+        if len(all_months) == 1:
+            min_day = min(m["start_day"] for m in range_matches)
+            max_day = max(m["end_day"] for m in range_matches)
+            return f"{min_day}-{max_day} {first['month']}"
+        else:
+            first_match = range_matches[0]
+            last_match = range_matches[-1]
+            return f"{first_match['start_day']} {first_match['month']} - {last_match['end_day']} {last_match['month']}"
+    
+    single_matches = []
+    for match in SINGLE_DATE_PATTERN.finditer(text):
+        day, month = match.groups()
+        try:
+            month_norm = _normalize_month(month)
+            single_matches.append({
+                "day": int(day),
+                "month": month_norm,
+                "start_pos": match.start()
+            })
+        except:
+            pass
+    
+    if single_matches:
+        single_matches.sort(key=lambda x: x["start_pos"])
+        if len(single_matches) >= 2:
+            return f"{single_matches[0]['day']} {single_matches[0]['month']} - {single_matches[-1]['day']} {single_matches[-1]['month']}"
+        else:
+            return f"{single_matches[0]['day']} {single_matches[0]['month']}"
+    
+    return ""
 
 
 def extract_kategori(text: str, title: str = "") -> str:
+    """
+    Extract kategori lomba dari teks dan judul.
+    Return salah satu: IT, Bisnis, Webdev, Design, Poster, Data, Mobile, Game, Multimedia, IoT, Robotics, Lainnya
+    """
     combined = f"{title} {text}".lower()
-
+    
     scores = {}
-
     for kategori, config in KATEGORI_KEYWORDS.items():
-        count = sum(
-            1 for kw in config["keywords"]
-            if kw in combined
-        )
-
-        if count > 0:
-            scores[kategori] = (
-                count,
-                config["priority"],
-            )
-
+        keyword_matches = sum(1 for kw in config["keywords"] if kw in combined)
+        if keyword_matches > 0:
+            scores[kategori] = (keyword_matches, config["priority"])
+    
     if not scores:
         return "Lainnya"
-
-    best = sorted(
-        scores.items(),
-        key=lambda x: (-x[1][0], x[1][1])
-    )[0]
-
+    
+    best = sorted(scores.items(), key=lambda x: (-x[1][0], x[1][1]))[0]
     return best[0]
 
 
-# ============================================================================
-# LINK EXTRACTION
-# ============================================================================
+# ---------------------------------------------------------------------------
+# HTML / soup helpers
+# ---------------------------------------------------------------------------
+
+def anchor_rows(soup: BeautifulSoup, base_url: str = "") -> list[dict]:
+    return [
+        {"url": href, "label": normalize_space(a.get_text(" "))}
+        for a in soup.find_all("a", href=True)
+        if (href := clean_url(a["href"], base_url))
+    ]
+
+
+def best_poster_from_soup(soup: BeautifulSoup, base_url: str = "") -> str:
+    for tag, attr in [("meta", "og:image"), ("meta", "twitter:image")]:
+        node = soup.find(tag, attrs={"property": attr} if "og:" in attr else {"name": attr})
+        if node and (url := clean_url(node.get("content", ""), base_url)):
+            return url
+
+    for img in soup.find_all("img"):
+        src = clean_url(
+            img.get("src") or img.get("data-src") or img.get("data-lazy-src") or "", base_url
+        )
+        if src and not any(skip in src.lower() for skip in ("logo", "avatar", "profile")):
+            return src
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Title extraction
+# ---------------------------------------------------------------------------
+
+def _line_has_url(line: str) -> bool:
+    return bool(URL_RE.search(line))
+
+
+def _is_noise_title(line: str) -> bool:
+    if _line_has_url(line) or len(normalize_space(line)) < 6:
+        return True
+    return _keywords_in(line, TITLE_NOISE_KEYWORDS)
+
+
+def _score_title(line: str, position: int) -> int:
+    lower = line.lower()
+    score = 100 - position
+    score += 25 * any(w in lower for w in {"lomba", "competition", "olimpiade", "challenge", "contest"})
+    score += 10 * any(w in lower for w in {"conference", "summit", "bootcamp", "program", "award"})
+    score += 8 * (line.isupper() and len(line) > 8)
+    score += 5 * bool(re.search(r"\b20\d{2}\b", line))
+    return score
+
+
+def extract_title_from_caption(caption: str) -> str:
+    lines = [normalize_space(l) for l in (caption or "").splitlines() if normalize_space(l)]
+    candidates: list[tuple[int, str]] = []
+
+    for idx, line in enumerate(lines[:25]):
+        match = OPEN_REGISTRATION_RE.search(strip_emoji_and_symbols(line))
+        if match:
+            title = clean_title(match.group(1))
+            if title != "Tanpa Judul":
+                candidates.append((_score_title(title, idx) + 35, title))
+                continue
+
+        if _is_noise_title(line):
+            continue
+        title = clean_title(line)
+        if title != "Tanpa Judul":
+            candidates.append((_score_title(title, idx), title))
+
+    if candidates:
+        return max(candidates)[1]
+
+    for line in lines:
+        if not _is_noise_title(line):
+            title = clean_title(line)
+            if title != "Tanpa Judul":
+                return title
+    return "Tanpa Judul"
+
+
+# ---------------------------------------------------------------------------
+# Link extraction (IMPROVED)
+# ---------------------------------------------------------------------------
 
 def extract_urls_from_text(text: str) -> list[str]:
-    seen = set()
-    result = []
-
-    for match in URL_RE.finditer(text or ""):
-        url = clean_url(match.group(0))
-
-        if url and url not in seen:
+    seen, result = set(), []
+    for m in URL_RE.finditer(text or ""):
+        url = clean_url(m.group(0))
+        if url and url not in seen and not is_low_value_url(url):
             seen.add(url)
             result.append(url)
-
     return result
 
 
-def extract_registration_links(text: str) -> list[str]:
-    found = []
+def extract_registration_links(text: str = "", anchors: list[dict] | None = None) -> list[str]:
+    """
+    Extract registration links dengan strategi berlapis:
+    1. Anchor links dengan registration context
+    2. Text-based dengan context window
+    3. Form hosts (forms.gle, bit.ly, etc)
+    4. Fallback: semua non-social URLs dari text
+    """
+    anchors = anchors or []
+    found: list[str] = []
     seen = set()
 
-    for url in extract_urls_from_text(text):
-        netloc = urlparse(url).netloc.lower()
+    for row in anchors:
+        url = clean_url(row.get("url", ""))
+        if not url or url in seen or is_low_value_url(url):
+            continue
+        
+        label = row.get("label", "")
+        if is_registration_context(label) and not is_non_registration_context(label):
+            found.append(url)
+            seen.add(url)
 
-        if any(host in netloc for host in FORM_HOSTS):
-            if url not in seen:
+    lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
+    for idx, line in enumerate(lines):
+        urls = extract_urls_from_text(line)
+        if not urls:
+            continue
+        
+        context = " ".join(lines[max(0, idx - 1): min(len(lines), idx + 2)])
+        
+        if is_registration_context(context) and not is_non_registration_context(line):
+            for url in urls:
+                if url not in seen:
+                    found.append(url)
+                    seen.add(url)
+
+    if not found:
+        all_anchors = [row["url"] for row in anchors if row.get("url")]
+        all_text_urls = extract_urls_from_text(text)
+        all_urls = all_anchors + all_text_urls
+        
+        for raw_url in all_urls:
+            url = clean_url(raw_url)
+            if url and url not in seen and not is_low_value_url(url):
+                netloc = urlparse(url).netloc.lower()
+                if any(host in netloc for host in FORM_HOSTS):
+                    found.append(url)
+                    seen.add(url)
+
+    if not found:
+        all_urls = extract_urls_from_text(text) + [row["url"] for row in anchors if row.get("url")]
+        for raw_url in all_urls:
+            url = clean_url(raw_url)
+            if url and url not in seen and not is_low_value_url(url):
                 found.append(url)
                 seen.add(url)
 
-    return found
+    return list(dict.fromkeys(found))
 
 
-# ============================================================================
-# LLM
-# ============================================================================
+# ---------------------------------------------------------------------------
+# LLM (OpenRouter DeepSeek) helpers
+# ---------------------------------------------------------------------------
 
-LLM_PROMPT = ( """
-Kamu adalah AI extractor data lomba mahasiswa Indonesia.
-
-Tugas:
-Analisis field "caption" pada setiap item lomba lalu ekstrak informasi penting.
-
-WAJIB:
-- Cari informasi HANYA dari field "caption"
-- Jangan membuat informasi yang tidak ada di caption
-- Jangan menebak
-- Jangan halusinasi
-
-Field output:
-- i = id
-- j = judul lomba
-- o = penyelenggara
-- d = deadline
-
-Rules:
-- Judul harus bersih dan singkat
-- Hapus emoji, hashtag, OPEN REGISTRATION, benefit, dll
-- Penyelenggara berupa kampus, organisasi, komunitas, atau instansi
-- Deadline format:
-  "28 Juni 2026"
-- Jika field tidak ditemukan isi string kosong
-- Jangan ubah id
-- Output HARUS valid JSON array
-- Jangan markdown
-- Jangan penjelasan tambahan
-
-Contoh:
-Input:
-{
-  "i": "abc123",
-  "caption": "OPEN REGISTRATION National Web Development Competition 2026 oleh Universitas Indonesia. Deadline 28 Juni 2026."
-}
-
-Output:
-[
-  {
-    "i": "abc123",
-    "j": "National Web Development Competition 2026",
-    "o": "Universitas Indonesia",
-    "d": "28 Juni 2026"
-  }
-]
-
-Data:
-"""
-)
-
-
-def llm_call(prompt: str) -> list:
-    if not GEMINI_API_KEY:
+def _call_openrouter(prompt: str) -> list:
+    """
+    Call OpenRouter API dengan DeepSeek v4 Flash (free tier)
+    """
+    if not OPENROUTER_API_KEY:
+        print("[LLM] OPENROUTER_API_KEY not set, skipping LLM processing")
         return []
-
-    headers = {
-        "Authorization": f"Bearer {GEMINI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    payload = {
-        "model": "deepseek/deepseek-v4-flash:free",
-        "messages": [
-            {
-                "role": "user",
-                "content": prompt,
-            }
-        ],
-        "temperature": 0.1,
-    }
-
+    
     try:
         response = requests.post(
-            OPENROUTER_URL,
-            headers=headers,
-            json=payload,
-            timeout=60,
+            url="https://openrouter.io/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "HTTP-Referer": "https://github.com",
+                "X-Title": "Competition Scraper",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "deepseek/deepseek-v4-flash:free",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                "temperature": 0.3,
+                "max_tokens": 2000,
+            },
+            timeout=60
         )
-
-        response.raise_for_status()
-
-        data = response.json()
-
-        content = (
-            data.get("choices", [{}])[0]
-            .get("message", {})
-            .get("content", "")
-        )
-
-        return safe_json_loads(content)
-
+        
+        if response.status_code != 200:
+            print(f"[LLM] Error {response.status_code}: {response.text}")
+            return []
+        
+        result = response.json()
+        content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+        
+        # Try to parse JSON from response
+        data = safe_json_loads(content)
+        return data if isinstance(data, list) else []
+        
     except Exception as exc:
         print(f"[LLM] Error: {exc}")
         return []
 
 
-def process_batch_with_llm(batch: list) -> list:
+_LLM_PROMPT_PREFIX = (
+    "Rapikan data lomba untuk mahasiswa. Untuk setiap item, kembalikan JSON array "
+    'dengan format {"id":"id","judul":"judul resmi","deadline":"timeline","kategori":"kategori","penyelenggara":"penyelenggara"}. '
+    "Field judul harus berupa nama lomba/program/event saja, tanpa emoji, sapaan, label "
+    "pendaftaran, tanggal, atau URL. "
+    "Field deadline adalah timeline gabungan dari tanggal awal sampai akhir "
+    "(cth: '23-28 Januari' atau '23 Januari - 28 Februari'), kosongkan jika tidak ada. "
+    "Field kategori adalah kategori lomba "
+    "(IT/Bisnis/Webdev/Design/Poster/Data/Mobile/Game/Multimedia/IoT/Robotics/Lainnya). "
+    "Field penyelenggara adalah nama organisasi atau institusi penyelenggara (kosongkan jika tidak ada). "
+    "Ekstrak dari caption yang diberikan. "
+    "Jika tidak yakin, pertahankan data yang sudah ada atau isi dengan string kosong.\n\nData: "
+)
+
+
+def process_batch_with_openrouter(batch: list) -> list:
+    """
+    Process batch items dengan OpenRouter DeepSeek
+    Ekstrak: deadline, kategori, penyelenggara dari caption
+    """
     if not batch:
         return batch
 
+    # Pre-extract timeline dan kategori dari text untuk reference
+    for item in batch:
+        caption = item.get("caption", "")
+        if not item.get("deadline"):
+            item["deadline"] = extract_timeline(caption)
+        if not item.get("kategori"):
+            item["kategori"] = extract_kategori(caption, item.get("judul", ""))
+
     payload = [
         {
-            "i": item["id"],
-            "judul": item.get("judul", "")[:100],
-            "caption": item.get("caption", "")[:800],
+            "id": item["id"],
+            "judul": item.get("judul", ""),
+            "caption": item.get("caption", "")[:1000],
+            "deadline": item.get("deadline", ""),
+            "kategori": item.get("kategori", ""),
         }
         for item in batch
     ]
 
-    rows = llm_call(
-        LLM_PROMPT + json.dumps(payload, ensure_ascii=False)
-    )
+    llm_results = _call_openrouter(_LLM_PROMPT_PREFIX + json.dumps(payload, ensure_ascii=False))
 
     llm_map = {
-        row["i"]: row
-        for row in rows
-        if isinstance(row, dict) and row.get("i")
+        row.get("id"): row
+        for row in llm_results
+        if isinstance(row, dict) and row.get("id")
     }
 
     for item in batch:
         row = llm_map.get(item["id"], {})
+        
+        # Update judul jika LLM return yang lebih baik
+        if row.get("judul"):
+            title = clean_title(row["judul"])
+            if title != "Tanpa Judul":
+                item["judul"] = title
+        
+        # Update deadline
+        if row.get("deadline"):
+            item["deadline"] = row["deadline"]
+        
+        # Update kategori
+        if row.get("kategori") and row["kategori"] != "Lainnya":
+            item["kategori"] = row["kategori"]
+        
+        # Update penyelenggara
+        if row.get("penyelenggara"):
+            item["penyelenggara"] = row["penyelenggara"]
 
-        if row.get("j"):
-            item["judul"] = clean_title(row["j"])
-
-        if row.get("o"):
-            item["penyelenggara"] = row["o"].strip()[:100]
-
-        if row.get("d"):
-            item["deadline"] = row["d"].strip()[:50]
-
+    time.sleep(1)
     return batch
 
 
-# ============================================================================
-# ITEM BUILDER
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Data structure builder
+# ---------------------------------------------------------------------------
 
-def build_item(
-    uid,
-    source,
-    title,
-    poster,
-    caption,
-    links,
-    direct_url,
-):
+def _build_item(uid, source, title, poster, caption, links, direct_url) -> dict:
+    """
+    Build item dengan struktur JSON baru
+    """
     return {
         "id": uid,
-        "sumber": source,
-        "judul": title,
-        "poster": poster,
         "caption": caption,
-        "link_pendaftaran": links,
-        "link_direct": direct_url,
-        "deadline": extract_deadline(caption),
+        "deadline": extract_timeline(caption),
+        "judul": title,
         "kategori": extract_kategori(caption, title),
-        "penyelenggara": "",
+        "link_direct": direct_url,
+        "link_pendaftaran": links,
+        "penyelenggara": "",  # Diisi oleh LLM
+        "poster": poster,
+        "sumber": source,
     }
 
 
-# ============================================================================
-# SCRAPER
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Scraper: infolomba.id
+# ---------------------------------------------------------------------------
 
 def scrape_infolomba(seen_ids: set) -> list:
     print("[infolomba] Starting...")
-
     base_url = "https://infolomba.id"
-
     scraper = cloudscraper.create_scraper()
-
     results = []
 
     try:
-        response = scraper.get(
-            base_url,
-            headers=HEADERS,
-            timeout=30,
-        )
+        resp = scraper.get(base_url, headers=HEADERS, timeout=30)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
 
-        response.raise_for_status()
-
-        soup = BeautifulSoup(
-            response.text,
-            "html.parser",
-        )
-
-        links = {
-            urljoin(base_url, a["href"])
-            for a in soup.find_all(
-                "a",
-                href=lambda h: h and "info-" in h,
-            )
+        unique_links = {
+            urljoin(base_url, a["href"]): a
+            for a in soup.find_all("a", href=lambda h: h and "info-" in h)
+            if urljoin(base_url, a.get("href", "")).startswith(base_url + "/")
         }
 
-        for link in list(links)[:MAX_WEB_ITEMS]:
+        for link, anchor in list(unique_links.items())[:MAX_WEB_ITEMS]:
             try:
-                detail = scraper.get(
-                    link,
-                    headers=HEADERS,
-                    timeout=30,
-                )
-
-                if detail.status_code != 200:
+                res = scraper.get(link, headers=HEADERS, timeout=30)
+                if res.status_code != 200:
                     continue
 
-                dsoup = BeautifulSoup(
-                    detail.text,
-                    "html.parser",
-                )
-
+                dsoup = BeautifulSoup(res.text, "html.parser")
                 full_text = dsoup.get_text("\n")
-
                 if not is_mahasiswa(full_text):
                     continue
 
                 title_tag = dsoup.find(["h1", "h2"])
-
-                title = clean_title(
-                    title_tag.get_text(" ")
-                    if title_tag
-                    else "Tanpa Judul"
+                slug_title = (
+                    "-".join(link.rstrip("/").split("/")[-1].replace("info-", "", 1).split("-")[:-1])
+                    .replace("-", " ").title()
                 )
-
-                uid = make_id(
-                    title,
-                    "infolomba.id",
-                )
-
+                title = clean_title(title_tag.get_text(" ") if title_tag else slug_title)
+                uid = make_id(title, "infolomba.id")
                 if uid in seen_ids:
                     continue
 
-                caption = "\n".join(
-                    line.strip()
-                    for line in full_text.splitlines()
-                    if line.strip()
-                )[:2500]
+                if "Daftar Sekarang" in full_text and "Laporkan Lomba" in full_text:
+                    body = full_text.split("Daftar Sekarang")[-1].split("Laporkan Lomba")[0]
+                    caption = "\n".join(l.strip() for l in body.splitlines() if l.strip())
+                else:
+                    caption = "\n".join(l.strip() for l in full_text.splitlines() if l.strip())[:2500]
 
-                poster = ""
+                poster = best_poster_from_soup(dsoup, base_url)
+                if not poster:
+                    img = anchor.find("img") or {}
+                    poster = clean_url(img.get("src") or img.get("data-src") or "", base_url)
 
-                meta = dsoup.find(
-                    "meta",
-                    attrs={"property": "og:image"},
-                )
-
-                if meta:
-                    poster = clean_url(
-                        meta.get("content", ""),
-                        base_url,
-                    )
-
-                item = build_item(
-                    uid,
-                    "infolomba.id",
-                    title,
-                    poster,
-                    caption,
-                    extract_registration_links(caption),
+                results.append(_build_item(
+                    uid, "infolomba.id", title, poster, caption,
+                    extract_registration_links(full_text, anchor_rows(dsoup, base_url)),
                     link,
-                )
-
-                results.append(item)
-
+                ))
                 seen_ids.add(uid)
 
             except Exception as exc:
-                print(f"[infolomba] Skip: {exc}")
+                print(f"[infolomba] Skip {link}: {exc}")
 
     except Exception as exc:
         print(f"[infolomba] Error: {exc}")
 
     print(f"[infolomba] Done: {len(results)} items")
-
     return results
 
 
-# ============================================================================
-# DEDUP
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Scraper: silomba.id
+# ---------------------------------------------------------------------------
 
-def tokenize(title: str) -> set:
+async def scrape_silomba(seen_ids: set) -> list:
+    print("[silomba] Starting...")
+    base_url = "https://silomba.id"
+    results = []
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        try:
+            page = await browser.new_page(user_agent=HEADERS["User-Agent"])
+            await page.goto(base_url, wait_until="networkidle", timeout=45000)
+            await page.wait_for_selector("#competition-section", timeout=15000)
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(2000)
+            soup = BeautifulSoup(await page.content(), "html.parser")
+            await page.close()
+
+            section = soup.find(id="competition-section")
+            if not section:
+                return results
+
+            for card in section.find_all("a", href=lambda h: h and h.startswith("/lomba/"))[:MAX_WEB_ITEMS]:
+                raw_title = (
+                    card.get("aria-label", "").replace("Lihat detail kompetisi ", "").strip()
+                    or (
+                        (h := card.find(["h1", "h2", "h3", "h4"])) and h.get_text(" ").strip()
+                    )
+                    or "Tanpa Judul"
+                )
+                title = clean_title(raw_title)
+                uid = make_id(title, "silomba.id")
+                if uid in seen_ids:
+                    continue
+
+                link_detail = urljoin(base_url, card["href"])
+                poster = caption = ""
+                links = []
+
+                try:
+                    dp = await browser.new_page(user_agent=HEADERS["User-Agent"])
+                    await dp.goto(link_detail, wait_until="networkidle", timeout=45000)
+                    dsoup = BeautifulSoup(await dp.content(), "html.parser")
+                    await dp.close()
+
+                    full_text = dsoup.get_text("\n")
+                    if not is_mahasiswa(full_text):
+                        continue
+
+                    poster = best_poster_from_soup(dsoup, base_url)
+                    caption = (
+                        full_text.split("Deskripsi Lomba")[-1].strip()
+                        if "Deskripsi Lomba" in full_text
+                        else "\n".join(l.strip() for l in full_text.splitlines() if l.strip())[:2500]
+                    )
+                    links = extract_registration_links(full_text, anchor_rows(dsoup, base_url))
+
+                except Exception as exc:
+                    print(f"[silomba] Detail failed {link_detail}: {exc}")
+
+                results.append(_build_item(uid, "silomba.id", title, poster, caption, links, link_detail))
+                seen_ids.add(uid)
+
+        except Exception as exc:
+            print(f"[silomba] Error: {exc}")
+        finally:
+            await browser.close()
+
+    print(f"[silomba] Done: {len(results)} items")
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Scraper: Instagram
+# ---------------------------------------------------------------------------
+
+def _normalize_ig_caption(raw: str) -> str:
+    caption = re.sub(r"^\s*[^:\n]{1,80}\s+on Instagram:\s*", "", (raw or "").strip(), flags=re.I)
+    return re.sub(r'^\s*"|\"\s*$', "", caption).strip()
+
+
+def _ig_shortcode(url: str) -> str:
+    match = INSTAGRAM_SHORTCODE_RE.search(url or "")
+    return match.group(1) if match else url
+
+
+def _build_chrome_driver() -> webdriver.Chrome:
+    opts = Options()
+    for arg in ("--headless=new", "--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage",
+                 f"user-agent={HEADERS['User-Agent']}"):
+        opts.add_argument(arg)
+    if os.path.exists("/opt/chrome/chrome"):
+        opts.binary_location = "/opt/chrome/chrome"
+    service = Service("/usr/bin/chromedriver") if os.path.exists("/usr/bin/chromedriver") else Service()
+    return webdriver.Chrome(service=service, options=opts)
+
+
+_IG_POSTER_JS = """
+const imgs = Array.from(document.querySelectorAll('article img'));
+for (const img of imgs) {
+  const src = img.currentSrc || img.src || '';
+  const alt = (img.alt || '').toLowerCase();
+  if (!src || alt.includes('profile') || src.includes('150x150')) continue;
+  if (src.includes('scontent') || src.includes('cdninstagram')) return src;
+}
+return '';
+"""
+
+
+def _collect_post_urls(driver, account: str) -> list[str]:
+    driver.get(f"https://www.instagram.com/{account}/")
+    time.sleep(random.randint(4, 6))
+    if "page not found" in driver.title.lower():
+        return []
+
+    seen, urls = set(), []
+    last_height = driver.execute_script("return document.body.scrollHeight")
+    for _ in range(3):
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        time.sleep(random.randint(2, 4))
+        for el in driver.find_elements(By.XPATH, '//a[contains(@href,"/p/") or contains(@href,"/reel/")]'):
+            href = el.get_attribute("href")
+            if href and href not in seen:
+                seen.add(href)
+                urls.append(href)
+        new_height = driver.execute_script("return document.body.scrollHeight")
+        if new_height == last_height:
+            break
+        last_height = new_height
+    return urls
+
+
+def _scrape_ig_post(driver, url: str, account: str, seen_ids: set) -> dict | None:
+    driver.get(url)
+    try:
+        WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "article")))
+    except Exception:
+        WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "img")))
+    time.sleep(random.randint(3, 5))
+
+    caption = ""
+    if h1s := driver.find_elements(By.XPATH, "//article//h1"):
+        caption = h1s[0].text
+    if not caption:
+        if metas := driver.find_elements(By.XPATH, '//meta[@property="og:description"]'):
+            raw = metas[0].get_attribute("content") or ""
+            caption = raw.split(": ", 1)[1] if ": " in raw else raw
+
+    caption = _normalize_ig_caption(caption or driver.title)
+    if not caption or not is_mahasiswa(caption):
+        return None
+
+    uid = make_id(_ig_shortcode(url), f"IG @{account}")
+    if uid in seen_ids:
+        return None
+
+    poster = driver.execute_script(_IG_POSTER_JS)
+    if not poster:
+        if og := driver.find_elements(By.XPATH, '//meta[@property="og:image"]'):
+            poster = og[0].get_attribute("content") or ""
+
+    title = extract_title_from_caption(caption)
+    return _build_item(
+        uid, f"IG @{account}",
+        title,
+        poster, caption,
+        extract_registration_links(caption),
+        url,
+    )
+
+
+def scrape_instagram(seen_ids: set) -> list:
+    if not IG_SESSION_ID:
+        print("[IG] IG_SESSION_ID not set, skipping.")
+        return []
+
+    print("[IG] Starting...")
+    results = []
+    driver = _build_chrome_driver()
+
+    try:
+        driver.get("https://www.instagram.com/")
+        time.sleep(3)
+        driver.add_cookie({"name": "sessionid", "value": IG_SESSION_ID, "domain": ".instagram.com"})
+        driver.refresh()
+        time.sleep(5)
+        if "login" in driver.current_url.lower():
+            print("[IG] Invalid session.")
+            return []
+
+        for account in IG_ACCOUNTS:
+            post_urls = _collect_post_urls(driver, account)
+            for url in post_urls[:MAX_IG_POSTS_PER_ACCOUNT]:
+                try:
+                    item = _scrape_ig_post(driver, url, account, seen_ids)
+                    if item:
+                        results.append(item)
+                        seen_ids.add(item["id"])
+                except Exception as exc:
+                    print(f"[IG] Skip post {url}: {exc}")
+
+    except Exception as exc:
+        print(f"[IG] Error: {exc}")
+    finally:
+        driver.quit()
+
+    print(f"[IG] Done: {len(results)} items")
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Deduplication
+# ---------------------------------------------------------------------------
+
+def _tokenize(title: str) -> set:
     return {
-        t
-        for t in re.sub(
-            r"[^\w\s]",
-            " ",
-            (title or "").lower(),
-        ).split()
+        t for t in re.sub(r"[^\w\s]", " ", (title or "").lower()).split()
         if t not in DEDUP_STOPWORDS and len(t) > 1
     }
 
 
-def jaccard(a: set, b: set) -> float:
+def _jaccard(a: set, b: set) -> float:
     return len(a & b) / len(a | b) if a and b else 0.0
 
 
-def dedup_results(new_items: list, db_data: list) -> list:
-    db_tokens = [
-        tokenize(d.get("judul", ""))
-        for d in db_data
-    ]
-
-    unique = []
+def dedup_results(new_items: list, db_data: list, threshold: float = 0.6) -> list:
+    db_direct_urls = {d["link_direct"] for d in db_data if d.get("link_direct")}
+    db_tokens = [_tokenize(d["judul"]) for d in db_data if d.get("judul")]
+    unique: list[dict] = []
 
     for item in new_items:
-        token = tokenize(item.get("judul", ""))
+        item["judul"] = clean_title(item.get("judul", ""))
+        item["link_pendaftaran"] = list(dict.fromkeys(
+            u for raw in item.get("link_pendaftaran", []) if (u := clean_url(raw))
+        ))
 
-        if any(
-            jaccard(token, db_tok) >= 0.6
-            for db_tok in db_tokens
-        ):
+        token = _tokenize(item.get("judul", ""))
+        link = item.get("link_direct", "")
+
+        if link and link in db_direct_urls:
+            print(f"[DEDUP] Skip duplicate URL: {link}")
+            continue
+        if any(_jaccard(token, db_tok) >= threshold for db_tok in db_tokens):
+            print(f"[DEDUP] Skip title similar to DB: {item['judul']!r}")
             continue
 
-        unique.append(item)
+        dup_idx = next(
+            (i for i, ex in enumerate(unique) if _jaccard(token, _tokenize(ex.get("judul", ""))) >= threshold),
+            None,
+        )
 
+        if dup_idx is not None:
+            existing = unique[dup_idx]
+            merged = list(dict.fromkeys(existing.get("link_pendaftaran", []) + item.get("link_pendaftaran", [])))
+            if SOURCE_PRIORITY.get(item["sumber"], 2) < SOURCE_PRIORITY.get(existing["sumber"], 2):
+                item["link_pendaftaran"] = merged
+                unique[dup_idx] = item
+                print(f"[DEDUP] Replace {existing['sumber']} -> {item['sumber']}: {item['judul']!r}")
+            else:
+                unique[dup_idx]["link_pendaftaran"] = merged
+                print(f"[DEDUP] Merge links {item['sumber']} -> {existing['sumber']}: {item['judul']!r}")
+        else:
+            unique.append(item)
+
+    print(f"[DEDUP] {len(new_items)} -> {len(unique)} unique items.")
     return unique
 
 
-# ============================================================================
-# MAIN
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 async def main():
     if not MONGO_URI:
-        raise RuntimeError("MONGO_URI is not set")
+        raise RuntimeError("MONGO_URI is not set.")
 
-    print("[INFO] Connecting MongoDB...")
-
+    print("[INFO] Connecting to MongoDB...")
     client = pymongo.MongoClient(MONGO_URI)
-
     collection = client[DB_NAME][COLLECTION]
 
-    db_data = list(
-        collection.find(
-            {},
-            {
-                "id": 1,
-                "judul": 1,
-                "_id": 0,
-            },
-        )
-    )
-
-    seen_ids = {
-        d["id"]
-        for d in db_data
-        if "id" in d
-    }
+    db_data = list(collection.find({}, {"id": 1, "link_direct": 1, "judul": 1, "_id": 0}))
+    seen_ids = {d["id"] for d in db_data if "id" in d}
+    print(f"[INFO] {len(seen_ids)} existing records in DB.")
 
     batches = await asyncio.gather(
-        asyncio.to_thread(
-            scrape_infolomba,
-            seen_ids,
-        ),
+        asyncio.to_thread(scrape_infolomba, seen_ids),
+        scrape_silomba(seen_ids),
+        asyncio.to_thread(scrape_instagram, seen_ids),
     )
-
-    raw = [
-        item
-        for batch in batches
-        if isinstance(batch, list)
-        for item in batch
-    ]
-
-    print(f"[INFO] Raw items: {len(raw)}")
+    raw = [item for batch in batches if isinstance(batch, list) for item in batch]
+    print(f"[INFO] {len(raw)} new raw items found.")
 
     if not raw:
-        print("[INFO] No new data")
+        print("[INFO] No new data.")
         client.close()
         return
 
     processed = []
-
     for i in range(0, len(raw), 15):
-        batch = raw[i:i + 15]
+        batch = raw[i: i + 15]
+        print(f"[LLM] Batch {i // 15 + 1} ({len(batch)} items)...")
+        processed.extend(process_batch_with_openrouter(batch))
 
-        processed.extend(
-            process_batch_with_llm(batch)
-        )
-
-    final = dedup_results(
-        processed,
-        db_data,
-    )
-
+    final = dedup_results(processed, db_data)
     if not final:
-        print("[INFO] No unique data")
+        print("[INFO] All items are duplicates.")
         client.close()
         return
 
     result = collection.bulk_write(
-        [
-            UpdateOne(
-                {"id": item["id"]},
-                {"$set": item},
-                upsert=True,
-            )
-            for item in final
-        ]
+        [UpdateOne({"id": item["id"]}, {"$set": item}, upsert=True) for item in final]
     )
-
-    print(
-        f"[INFO] Saved: "
-        f"{result.upserted_count} new, "
-        f"{result.modified_count} updated"
-    )
-
+    print(f"[INFO] Saved: {result.upserted_count} new, {result.modified_count} updated.")
     client.close()
 
 
