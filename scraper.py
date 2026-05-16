@@ -12,6 +12,7 @@ from urllib.parse import urljoin, urlparse
 
 import cloudscraper
 import pymongo
+import requests
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 from pymongo import UpdateOne
@@ -22,37 +23,18 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-try:
-    from google import genai
-    from google.genai import types as genai_types
-except Exception:
-    genai = None
-    genai_types = None
-
 
 # ============================================================================
-# CONFIGURATION
+# CONFIG
 # ============================================================================
 
-IG_SESSION_ID = os.environ.get("IG_SESSION_ID", "")
 MONGO_URI = os.environ.get("MONGO_URI")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+
 DB_NAME = os.environ.get("DB_NAME", "competition_scraper")
 COLLECTION = os.environ.get("COLLECTION", "competition")
 
-IG_ACCOUNTS = [
-    a.strip()
-    for a in os.environ.get(
-        "IG_ACCOUNTS",
-        "infolomba,infolomba_gratis,infolomba.olimpiade",
-    ).split(",")
-    if a.strip()
-]
-
 MAX_WEB_ITEMS = int(os.environ.get("MAX_WEB_ITEMS", "15"))
-MAX_IG_POSTS_PER_ACCOUNT = int(
-    os.environ.get("MAX_IG_POSTS_PER_ACCOUNT", "6")
-)
 
 HEADERS = {
     "User-Agent": (
@@ -62,17 +44,20 @@ HEADERS = {
     )
 }
 
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+
 
 # ============================================================================
 # REGEX
 # ============================================================================
 
 URL_RE = re.compile(r"https?://[^\s<>'\"`)\]}]+", re.IGNORECASE)
-INSTAGRAM_SHORTCODE_RE = re.compile(r"/(?:p|reel)/([^/?#]+)/?")
+
 TITLE_PREFIX_RE = re.compile(
     r"^\s*(?:judul|title|nama\s+lomba|competition|event)\s*[:-]\s*",
     re.IGNORECASE,
 )
+
 WHITESPACE_RE = re.compile(r"\s+")
 
 DEADLINE_PATTERN = re.compile(
@@ -86,43 +71,6 @@ DEADLINE_PATTERN = re.compile(
 # KEYWORDS
 # ============================================================================
 
-REGISTRATION_KEYWORDS = {
-    "daftar",
-    "pendaftaran",
-    "register",
-    "registrasi",
-    "registration",
-    "apply",
-    "submission",
-}
-
-NON_REGISTRATION_KEYWORDS = {
-    "guidebook",
-    "booklet",
-    "juknis",
-    "contact",
-    "kontak",
-    "whatsapp",
-    "cp",
-    "email",
-    "instagram",
-    "tiktok",
-    "youtube",
-}
-
-TITLE_NOISE_KEYWORDS = {
-    "link pendaftaran",
-    "pendaftaran",
-    "register",
-    "registration",
-    "deadline",
-    "benefit",
-    "prize",
-    "hadiah",
-    "save the date",
-    "open registration",
-}
-
 MAHASISWA_KEYWORDS = {
     "mahasiswa",
     "mahasiswi",
@@ -133,18 +81,6 @@ MAHASISWA_KEYWORDS = {
     "d4",
     "student",
     "university",
-    "umum",
-}
-
-BLOCKED_SOCIAL_HOSTS = {
-    "instagram.com",
-    "facebook.com",
-    "twitter.com",
-    "x.com",
-    "youtube.com",
-    "youtu.be",
-    "tiktok.com",
-    "wa.me",
 }
 
 FORM_HOSTS = {
@@ -172,14 +108,6 @@ DEDUP_STOPWORDS = {
     "dan",
     "atau",
     "untuk",
-    "dengan",
-    "dalam",
-    "dari",
-}
-
-SOURCE_PRIORITY = {
-    "infolomba.id": 0,
-    "silomba.id": 1,
 }
 
 MONTH_MAP = {
@@ -193,84 +121,53 @@ MONTH_MAP = {
     "march": "Maret",
     "mar": "Maret",
     "april": "April",
-    "apr": "April",
     "mei": "Mei",
     "may": "Mei",
     "juni": "Juni",
-    "june": "Juni",
-    "jun": "Juni",
-    "juli": "Juli",
     "july": "Juli",
-    "jul": "Juli",
-    "agustus": "Agustus",
+    "juli": "Juli",
     "august": "Agustus",
-    "aug": "Agustus",
+    "agustus": "Agustus",
     "september": "September",
-    "sept": "September",
-    "sep": "September",
     "oktober": "Oktober",
-    "october": "Oktober",
-    "oct": "Oktober",
     "november": "November",
-    "nov": "November",
     "desember": "Desember",
-    "december": "Desember",
-    "dec": "Desember",
 }
 
 KATEGORI_KEYWORDS = {
     "IT": {
         "keywords": {
-            "it",
             "programming",
             "coding",
             "developer",
-            "web",
-            "app",
             "software",
-            "database",
-            "ai",
-            "machine learning",
-            "data science",
             "backend",
             "frontend",
             "fullstack",
             "python",
             "javascript",
             "java",
-            "c++",
-            "php",
-            "golang",
-            "cybersecurity",
-            "pemrograman",
-            "programmer",
         },
         "priority": 1,
     },
     "Webdev": {
         "keywords": {
+            "web",
             "webdev",
-            "web development",
-            "frontend",
-            "backend",
-            "fullstack",
             "react",
             "vue",
             "html",
             "css",
-            "javascript",
         },
         "priority": 1,
     },
     "Design": {
         "keywords": {
             "design",
-            "graphic design",
             "ui",
             "ux",
-            "illustration",
             "figma",
-            "photoshop",
+            "poster",
         },
         "priority": 2,
     },
@@ -281,16 +178,13 @@ KATEGORI_KEYWORDS = {
 # HELPERS
 # ============================================================================
 
-
 def make_id(title: str, source: str) -> str:
-    normalized = f"{source}_{title}".lower().strip()
-    return hashlib.md5(normalized.encode()).hexdigest()[:12]
-
+    raw = f"{source}_{title}".lower().strip()
+    return hashlib.md5(raw.encode()).hexdigest()[:12]
 
 
 def normalize_space(text: str) -> str:
     return WHITESPACE_RE.sub(" ", text or "").strip()
-
 
 
 def is_mahasiswa(text: str) -> bool:
@@ -298,13 +192,12 @@ def is_mahasiswa(text: str) -> bool:
     return any(kw in lower for kw in MAHASISWA_KEYWORDS)
 
 
-
 def clean_url(url: str, base_url: str = "") -> str:
     if not url:
         return ""
 
     url = url.strip().strip(".,;:!?'\")]}")
-
+    
     if url.startswith("//"):
         url = "https:" + url
     elif base_url and url.startswith("/"):
@@ -313,8 +206,7 @@ def clean_url(url: str, base_url: str = "") -> str:
     return url if url.startswith(("http://", "https://")) else ""
 
 
-
-def strip_emoji_and_symbols(text: str) -> str:
+def strip_emoji(text: str) -> str:
     return "".join(
         " "
         if (
@@ -326,28 +218,27 @@ def strip_emoji_and_symbols(text: str) -> str:
     )
 
 
-
 def clean_title(text: str) -> str:
-    text = strip_emoji_and_symbols(text)
+    text = strip_emoji(text)
     text = TITLE_PREFIX_RE.sub("", text)
     text = re.sub(r"https?://\S+", " ", text)
-    text = re.sub(r'[@#*_>|"\'']+', " ", text)
-    text = re.sub(
-        r"\b(?:caption|repost|info lomba|infolomba)\b",
-        " ",
-        text,
-        flags=re.I,
-    )
+    text = re.sub(r"[@#*_>|\"']+", " ", text)
     return normalize_space(text)[:140].strip(" -:|") or "Tanpa Judul"
-
 
 
 def safe_json_loads(text: str) -> list:
     try:
         return json.loads(text)
     except Exception:
-        return []
+        match = re.search(r"\[.*\]", text or "", re.S)
 
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except Exception:
+                pass
+
+    return []
 
 
 def extract_deadline(text: str) -> str:
@@ -360,33 +251,43 @@ def extract_deadline(text: str) -> str:
         return ""
 
     day, month, year = match.groups()
+
     month_norm = MONTH_MAP.get(month.lower(), month)
 
     return f"{day} {month_norm}" + (f" {year}" if year else "")
 
 
-
 def extract_kategori(text: str, title: str = "") -> str:
     combined = f"{title} {text}".lower()
+
     scores = {}
 
     for kategori, config in KATEGORI_KEYWORDS.items():
-        matches = sum(1 for kw in config["keywords"] if kw in combined)
+        count = sum(
+            1 for kw in config["keywords"]
+            if kw in combined
+        )
 
-        if matches > 0:
-            scores[kategori] = (matches, config["priority"])
+        if count > 0:
+            scores[kategori] = (
+                count,
+                config["priority"],
+            )
 
     if not scores:
         return "Lainnya"
 
-    best = sorted(scores.items(), key=lambda x: (-x[1][0], x[1][1]))[0]
+    best = sorted(
+        scores.items(),
+        key=lambda x: (-x[1][0], x[1][1])
+    )[0]
+
     return best[0]
 
 
 # ============================================================================
 # LINK EXTRACTION
 # ============================================================================
-
 
 def extract_urls_from_text(text: str) -> list[str]:
     seen = set()
@@ -402,8 +303,7 @@ def extract_urls_from_text(text: str) -> list[str]:
     return result
 
 
-
-def extract_registration_links(text: str = "") -> list[str]:
+def extract_registration_links(text: str) -> list[str]:
     found = []
     seen = set()
 
@@ -419,54 +319,108 @@ def extract_registration_links(text: str = "") -> list[str]:
 
 
 # ============================================================================
-# GEMINI
+# LLM
 # ============================================================================
 
+LLM_PROMPT = ( """
+Kamu adalah AI extractor data lomba mahasiswa Indonesia.
 
-def create_gemini_client():
-    if not GEMINI_API_KEY or not genai:
-        return None
+Tugas:
+Analisis field "caption" pada setiap item lomba lalu ekstrak informasi penting.
 
-    try:
-        return genai.Client(api_key=GEMINI_API_KEY)
-    except Exception:
-        return None
+WAJIB:
+- Cari informasi HANYA dari field "caption"
+- Jangan membuat informasi yang tidak ada di caption
+- Jangan menebak
+- Jangan halusinasi
 
+Field output:
+- i = id
+- j = judul lomba
+- o = penyelenggara
+- d = deadline
 
-GEMINI_CLIENT = create_gemini_client()
+Rules:
+- Judul harus bersih dan singkat
+- Hapus emoji, hashtag, OPEN REGISTRATION, benefit, dll
+- Penyelenggara berupa kampus, organisasi, komunitas, atau instansi
+- Deadline format:
+  "28 Juni 2026"
+- Jika field tidak ditemukan isi string kosong
+- Jangan ubah id
+- Output HARUS valid JSON array
+- Jangan markdown
+- Jangan penjelasan tambahan
 
+Contoh:
+Input:
+{
+  "i": "abc123",
+  "caption": "OPEN REGISTRATION National Web Development Competition 2026 oleh Universitas Indonesia. Deadline 28 Juni 2026."
+}
 
-LLM_PROMPT = (
-    "Analisis data lomba mahasiswa. Return JSON array format: "
-    '{"i":"id","j":"judul","o":"penyelenggara","d":"deadline"}. '
-    "Jika field tidak ditemukan isi string kosong. Data:\n"
+Output:
+[
+  {
+    "i": "abc123",
+    "j": "National Web Development Competition 2026",
+    "o": "Universitas Indonesia",
+    "d": "28 Juni 2026"
+  }
+]
+
+Data:
+"""
 )
 
 
-
 def llm_call(prompt: str) -> list:
-    if not GEMINI_CLIENT or not genai_types:
+    if not GEMINI_API_KEY:
         return []
 
+    headers = {
+        "Authorization": f"Bearer {GEMINI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "model": "deepseek/deepseek-v4-flash:free",
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        ],
+        "temperature": 0.1,
+    }
+
     try:
-        response = GEMINI_CLIENT.models.generate_content(
-            model="gemini-2.0-flash-lite",
-            contents=prompt,
-            config=genai_types.GenerateContentConfig(
-                response_mime_type="application/json"
-            ),
+        response = requests.post(
+            OPENROUTER_URL,
+            headers=headers,
+            json=payload,
+            timeout=60,
         )
 
-        return safe_json_loads(response.text or "")
+        response.raise_for_status()
+
+        data = response.json()
+
+        content = (
+            data.get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "")
+        )
+
+        return safe_json_loads(content)
 
     except Exception as exc:
         print(f"[LLM] Error: {exc}")
         return []
 
 
-
-def process_batch_with_gemini(batch: list) -> list:
-    if not GEMINI_CLIENT or not batch:
+def process_batch_with_llm(batch: list) -> list:
+    if not batch:
         return batch
 
     payload = [
@@ -478,11 +432,13 @@ def process_batch_with_gemini(batch: list) -> list:
         for item in batch
     ]
 
+    rows = llm_call(
+        LLM_PROMPT + json.dumps(payload, ensure_ascii=False)
+    )
+
     llm_map = {
         row["i"]: row
-        for row in llm_call(
-            LLM_PROMPT + json.dumps(payload, ensure_ascii=False)
-        )
+        for row in rows
         if isinstance(row, dict) and row.get("i")
     }
 
@@ -502,9 +458,8 @@ def process_batch_with_gemini(batch: list) -> list:
 
 
 # ============================================================================
-# BUILD ITEM
+# ITEM BUILDER
 # ============================================================================
-
 
 def build_item(
     uid,
@@ -530,47 +485,73 @@ def build_item(
 
 
 # ============================================================================
-# INFOLMBA SCRAPER
+# SCRAPER
 # ============================================================================
-
 
 def scrape_infolomba(seen_ids: set) -> list:
     print("[infolomba] Starting...")
 
     base_url = "https://infolomba.id"
+
     scraper = cloudscraper.create_scraper()
+
     results = []
 
     try:
-        response = scraper.get(base_url, headers=HEADERS, timeout=30)
+        response = scraper.get(
+            base_url,
+            headers=HEADERS,
+            timeout=30,
+        )
+
         response.raise_for_status()
 
-        soup = BeautifulSoup(response.text, "html.parser")
+        soup = BeautifulSoup(
+            response.text,
+            "html.parser",
+        )
 
         links = {
             urljoin(base_url, a["href"])
-            for a in soup.find_all("a", href=lambda h: h and "info-" in h)
+            for a in soup.find_all(
+                "a",
+                href=lambda h: h and "info-" in h,
+            )
         }
 
         for link in list(links)[:MAX_WEB_ITEMS]:
             try:
-                detail = scraper.get(link, headers=HEADERS, timeout=30)
+                detail = scraper.get(
+                    link,
+                    headers=HEADERS,
+                    timeout=30,
+                )
 
                 if detail.status_code != 200:
                     continue
 
-                dsoup = BeautifulSoup(detail.text, "html.parser")
+                dsoup = BeautifulSoup(
+                    detail.text,
+                    "html.parser",
+                )
+
                 full_text = dsoup.get_text("\n")
 
                 if not is_mahasiswa(full_text):
                     continue
 
                 title_tag = dsoup.find(["h1", "h2"])
+
                 title = clean_title(
-                    title_tag.get_text(" ") if title_tag else "Tanpa Judul"
+                    title_tag.get_text(" ")
+                    if title_tag
+                    else "Tanpa Judul"
                 )
 
-                uid = make_id(title, "infolomba.id")
+                uid = make_id(
+                    title,
+                    "infolomba.id",
+                )
 
                 if uid in seen_ids:
                     continue
@@ -583,10 +564,16 @@ def scrape_infolomba(seen_ids: set) -> list:
 
                 poster = ""
 
-                meta = dsoup.find("meta", attrs={"property": "og:image"})
+                meta = dsoup.find(
+                    "meta",
+                    attrs={"property": "og:image"},
+                )
 
                 if meta:
-                    poster = clean_url(meta.get("content", ""), base_url)
+                    poster = clean_url(
+                        meta.get("content", ""),
+                        base_url,
+                    )
 
                 item = build_item(
                     uid,
@@ -599,6 +586,7 @@ def scrape_infolomba(seen_ids: set) -> list:
                 )
 
                 results.append(item)
+
                 seen_ids.add(uid)
 
             except Exception as exc:
@@ -608,6 +596,7 @@ def scrape_infolomba(seen_ids: set) -> list:
         print(f"[infolomba] Error: {exc}")
 
     print(f"[infolomba] Done: {len(results)} items")
+
     return results
 
 
@@ -615,30 +604,37 @@ def scrape_infolomba(seen_ids: set) -> list:
 # DEDUP
 # ============================================================================
 
-
 def tokenize(title: str) -> set:
     return {
         t
-        for t in re.sub(r"[^\w\s]", " ", (title or "").lower()).split()
+        for t in re.sub(
+            r"[^\w\s]",
+            " ",
+            (title or "").lower(),
+        ).split()
         if t not in DEDUP_STOPWORDS and len(t) > 1
     }
-
 
 
 def jaccard(a: set, b: set) -> float:
     return len(a & b) / len(a | b) if a and b else 0.0
 
 
-
 def dedup_results(new_items: list, db_data: list) -> list:
-    db_tokens = [tokenize(d.get("judul", "")) for d in db_data]
+    db_tokens = [
+        tokenize(d.get("judul", ""))
+        for d in db_data
+    ]
 
     unique = []
 
     for item in new_items:
         token = tokenize(item.get("judul", ""))
 
-        if any(jaccard(token, db_tok) >= 0.6 for db_tok in db_tokens):
+        if any(
+            jaccard(token, db_tok) >= 0.6
+            for db_tok in db_tokens
+        ):
             continue
 
         unique.append(item)
@@ -650,7 +646,6 @@ def dedup_results(new_items: list, db_data: list) -> list:
 # MAIN
 # ============================================================================
 
-
 async def main():
     if not MONGO_URI:
         raise RuntimeError("MONGO_URI is not set")
@@ -658,10 +653,18 @@ async def main():
     print("[INFO] Connecting MongoDB...")
 
     client = pymongo.MongoClient(MONGO_URI)
+
     collection = client[DB_NAME][COLLECTION]
 
     db_data = list(
-        collection.find({}, {"id": 1, "judul": 1, "_id": 0})
+        collection.find(
+            {},
+            {
+                "id": 1,
+                "judul": 1,
+                "_id": 0,
+            },
+        )
     )
 
     seen_ids = {
@@ -671,7 +674,10 @@ async def main():
     }
 
     batches = await asyncio.gather(
-        asyncio.to_thread(scrape_infolomba, seen_ids),
+        asyncio.to_thread(
+            scrape_infolomba,
+            seen_ids,
+        ),
     )
 
     raw = [
@@ -683,16 +689,27 @@ async def main():
 
     print(f"[INFO] Raw items: {len(raw)}")
 
+    if not raw:
+        print("[INFO] No new data")
+        client.close()
+        return
+
     processed = []
 
     for i in range(0, len(raw), 15):
         batch = raw[i:i + 15]
-        processed.extend(process_batch_with_gemini(batch))
 
-    final = dedup_results(processed, db_data)
+        processed.extend(
+            process_batch_with_llm(batch)
+        )
+
+    final = dedup_results(
+        processed,
+        db_data,
+    )
 
     if not final:
-        print("[INFO] No new data")
+        print("[INFO] No unique data")
         client.close()
         return
 
@@ -708,7 +725,8 @@ async def main():
     )
 
     print(
-        f"[INFO] Saved: {result.upserted_count} new, "
+        f"[INFO] Saved: "
+        f"{result.upserted_count} new, "
         f"{result.modified_count} updated"
     )
 
