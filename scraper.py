@@ -62,15 +62,15 @@ OPEN_REGISTRATION_RE = re.compile(
 )
 WHITESPACE_RE = re.compile(r"\s+")
 
+# IMPROVED: Better date range pattern
 TIMELINE_PATTERN = re.compile(
-    r"(?:pendaftaran|registration|open|close|pengumpulan|submission|deadline|tutup|tanggal|date|mulai|start|akhir|end)?\s*[:\-]?\s*"
-    r"(\d{1,2})\s*[-–—]\s*(\d{1,2})\s+([a-zA-Z]+)",
+    r"(\d{1,2})\s*[-–—]\s*(\d{1,2})\s+([a-zA-Z]+)\s*(\d{4})?",
     re.IGNORECASE
 )
 
+# IMPROVED: Single date pattern with optional year
 SINGLE_DATE_PATTERN = re.compile(
-    r"(?:pendaftaran|registration|open|close|pengumpulan|submission|deadline|tutup|tanggal|date|mulai|start|akhir|end)?\s*[:\-]?\s*"
-    r"(\d{1,2})\s+([a-zA-Z]+)",
+    r"(\d{1,2})\s+([a-zA-Z]+)\s+(\d{4})?",
     re.IGNORECASE
 )
 
@@ -78,9 +78,9 @@ SINGLE_DATE_PATTERN = re.compile(
 # Keyword sets
 # ---------------------------------------------------------------------------
 
-REGISTRATION_KEYWORDS = {"daftar", "pendaftaran", "register", "registrasi", "registration", "apply", "submission", "submit"}
-NON_REGISTRATION_KEYWORDS = {"guidebook", "booklet", "juknis", "contact", "kontak", "whatsapp", "wa.me", "cp", "narahubung", "email", "instagram", "tiktok", "youtube"}
-TITLE_NOISE_KEYWORDS = {"link pendaftaran", "pendaftaran", "register", "registration", "apply now", "guidebook", "contact us", "whatsapp", "deadline", "benefit", "prize", "hadiah", "timeline", "save the date", "open registration", "closed registration", "terbuka untuk", "untuk mahasiswa"}
+REGISTRATION_KEYWORDS = {"daftar", "pendaftaran", "register", "registrasi", "registration", "apply", "submission", "submit", "link pendaftaran"}
+NON_REGISTRATION_KEYWORDS = {"guidebook", "booklet", "juknis", "contact", "kontak", "narahubung", "email", "tiktok", "youtube", "disclaimer"}
+TITLE_NOISE_KEYWORDS = {"link pendaftaran", "pendaftaran", "register", "registration", "apply now", "guidebook", "contact us", "deadline", "benefit", "prize", "hadiah", "timeline", "save the date", "open registration", "closed registration", "terbuka untuk", "untuk mahasiswa"}
 MAHASISWA_KEYWORDS = {"mahasiswa", "mahasiswi", "universitas", "kampus", "s1", "d3", "d4", "umum", "undergraduate", "diploma", "student", "university"}
 BLOCKED_SOCIAL_HOSTS = {"instagram.com", "facebook.com", "twitter.com", "x.com", "youtube.com", "youtu.be", "tiktok.com", "wa.me", "api.whatsapp.com"}
 FORM_HOSTS = {"forms.gle", "docs.google.com", "bit.ly", "s.id", "tinyurl.com", "lynk.id"}
@@ -99,7 +99,7 @@ KATEGORI_KEYWORDS = {
     "Bisnis": {
         "keywords": {"bisnis", "business", "entrepreneurship", "startup", "pitch", "investor",
                      "kewirausahaan", "wirausaha", "marketing", "finance", "accounting", "sales",
-                     "business plan", "investor pitch", "venture", "unicorn"},
+                     "business plan", "investor pitch", "venture", "unicorn", "career"},
         "priority": 2
     },
     "Webdev": {
@@ -244,7 +244,7 @@ def is_non_registration_context(text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Timeline & Kategori extraction (IMPROVED)
+# Timeline & Kategori extraction (REFACTORED)
 # ---------------------------------------------------------------------------
 
 def _normalize_month(month_str: str) -> str:
@@ -254,27 +254,27 @@ def _normalize_month(month_str: str) -> str:
 
 def extract_timeline(text: str) -> str:
     """
-    Extract timeline dari teks dengan berbagai format:
-    - Range: "23-24 Januari", "23-28 Jan"
-    - Single: "23 Januari"
-    - Context: "Pendaftaran: 23-24 Januari"
-    
-    Returns format: "dd-dd BulanNama" atau "dd BulanNama - dd BulanNama"
+    IMPROVED: Extract timeline dengan lebih akurat
+    Format output: "dd-dd BulanNama" atau "dd BulanNama" atau "dd BulanNama - dd BulanNama" atau ""
     """
     if not text:
         return ""
     
-    # Coba ekstrak range dahulu
+    text_lower = text.lower()
+    
+    # Strategy 1: Cari date range dengan pattern "13 - 19 Mei 2026"
     range_matches = []
     for match in TIMELINE_PATTERN.finditer(text):
-        day_start, day_end, month = match.groups()
+        day_start, day_end, month, year = match.groups()
         try:
             month_norm = _normalize_month(month)
+            year_str = year if year else "2026"  # Default ke 2026 jika tahun tidak ada
             range_matches.append({
                 "type": "range",
                 "start_day": int(day_start),
                 "end_day": int(day_end),
                 "month": month_norm,
+                "year": year_str,
                 "start_pos": match.start()
             })
         except:
@@ -282,26 +282,34 @@ def extract_timeline(text: str) -> str:
     
     if range_matches:
         range_matches.sort(key=lambda x: x["start_pos"])
-        first = range_matches[0]
         
+        # Jika hanya satu bulan, format: "dd-dd BulanNama TahunNama"
+        first = range_matches[0]
         all_months = set(m["month"] for m in range_matches)
+        
         if len(all_months) == 1:
             min_day = min(m["start_day"] for m in range_matches)
             max_day = max(m["end_day"] for m in range_matches)
-            return f"{min_day}-{max_day} {first['month']}"
+            year_str = first.get("year", "2026")
+            return f"{min_day}-{max_day} {first['month']} {year_str}".strip()
         else:
+            # Multiple months: "dd BulanNama - dd BulanNama TahunNama"
             first_match = range_matches[0]
             last_match = range_matches[-1]
-            return f"{first_match['start_day']} {first_match['month']} - {last_match['end_day']} {last_match['month']}"
+            year_str = last_match.get("year", "2026")
+            return f"{first_match['start_day']} {first_match['month']} - {last_match['end_day']} {last_match['month']} {year_str}".strip()
     
+    # Strategy 2: Cari single dates "7 Juni 2026" atau "7 Juni"
     single_matches = []
     for match in SINGLE_DATE_PATTERN.finditer(text):
-        day, month = match.groups()
+        day, month, year = match.groups()
         try:
             month_norm = _normalize_month(month)
+            year_str = year if year else "2026"
             single_matches.append({
                 "day": int(day),
                 "month": month_norm,
+                "year": year_str,
                 "start_pos": match.start()
             })
         except:
@@ -309,18 +317,25 @@ def extract_timeline(text: str) -> str:
     
     if single_matches:
         single_matches.sort(key=lambda x: x["start_pos"])
+        
+        # Jika ada 2+ single dates: "dd BulanNama - dd BulanNama TahunNama"
         if len(single_matches) >= 2:
-            return f"{single_matches[0]['day']} {single_matches[0]['month']} - {single_matches[-1]['day']} {single_matches[-1]['month']}"
+            first = single_matches[0]
+            last = single_matches[-1]
+            # Gunakan tahun dari last match atau first jika last tidak ada
+            year_str = last.get("year", first.get("year", "2026"))
+            return f"{first['day']} {first['month']} - {last['day']} {last['month']} {year_str}".strip()
         else:
-            return f"{single_matches[0]['day']} {single_matches[0]['month']}"
+            # Hanya 1 single date: "dd BulanNama TahunNama"
+            match = single_matches[0]
+            return f"{match['day']} {match['month']} {match['year']}".strip()
     
     return ""
 
 
 def extract_kategori(text: str, title: str = "") -> str:
     """
-    Extract kategori lomba dari teks dan judul.
-    Return salah satu: IT, Bisnis, Webdev, Design, Poster, Data, Mobile, Game, Multimedia, IoT, Robotics, Lainnya
+    IMPROVED: Extract kategori dengan semantic understanding
     """
     combined = f"{title} {text}".lower()
     
@@ -328,12 +343,14 @@ def extract_kategori(text: str, title: str = "") -> str:
     for kategori, config in KATEGORI_KEYWORDS.items():
         keyword_matches = sum(1 for kw in config["keywords"] if kw in combined)
         if keyword_matches > 0:
-            scores[kategori] = (keyword_matches, config["priority"])
+            # Score = (match_count * 10) - priority (lower priority = higher score)
+            scores[kategori] = (keyword_matches * 10, -config["priority"])
     
     if not scores:
         return "Lainnya"
     
-    best = sorted(scores.items(), key=lambda x: (-x[1][0], x[1][1]))[0]
+    # Sort by match count descending, then by priority
+    best = sorted(scores.items(), key=lambda x: (x[1][0], x[1][1]), reverse=True)[0]
     return best[0]
 
 
@@ -365,7 +382,7 @@ def best_poster_from_soup(soup: BeautifulSoup, base_url: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
-# Title extraction
+# Title extraction (REFACTORED)
 # ---------------------------------------------------------------------------
 
 def _line_has_url(line: str) -> bool:
@@ -379,49 +396,77 @@ def _is_noise_title(line: str) -> bool:
 
 
 def _score_title(line: str, position: int) -> int:
+    """IMPROVED: Better scoring untuk title extraction"""
     lower = line.lower()
-    score = 100 - position
-    score += 25 * any(w in lower for w in {"lomba", "competition", "olimpiade", "challenge", "contest"})
-    score += 10 * any(w in lower for w in {"conference", "summit", "bootcamp", "program", "award"})
-    score += 8 * (line.isupper() and len(line) > 8)
-    score += 5 * bool(re.search(r"\b20\d{2}\b", line))
-    return score
+    score = 100 - (position * 5)  # Prefer earlier lines
+    
+    # High-value keywords
+    score += 40 * any(w in lower for w in {"lomba", "olimpiade", "competition", "contest"})
+    score += 35 * any(w in lower for w in {"national", "nasional", "se-indonesia"})
+    score += 30 * any(w in lower for w in {"championship", "tournament", "kompetisi"})
+    score += 20 * any(w in lower for w in {"conference", "summit", "bootcamp", "program", "award"})
+    
+    # Structural indicators
+    score += 15 * (line.isupper() and len(line) > 8)
+    score += 10 * bool(re.search(r"\b20\d{2}\b", line))
+    
+    return max(0, score)
 
 
 def extract_title_from_caption(caption: str) -> str:
+    """
+    IMPROVED: Extract title dengan logic yang lebih smart
+    - Prioritas 1: Official headers (CAPS, h1/h2 text)
+    - Prioritas 2: Lines dengan competition keywords
+    - Prioritas 3: First non-noise line
+    """
     lines = [normalize_space(l) for l in (caption or "").splitlines() if normalize_space(l)]
     candidates: list[tuple[int, str]] = []
 
-    for idx, line in enumerate(lines[:25]):
+    # Pass 1: Cari lines dengan "open registration" pattern
+    for idx, line in enumerate(lines[:20]):
         match = OPEN_REGISTRATION_RE.search(strip_emoji_and_symbols(line))
         if match:
             title = clean_title(match.group(1))
             if title != "Tanpa Judul":
-                candidates.append((_score_title(title, idx) + 35, title))
-                continue
+                candidates.append((_score_title(title, idx) + 50, title))
 
+    # Pass 2: Score all non-noise lines
+    for idx, line in enumerate(lines[:25]):
         if _is_noise_title(line):
             continue
+        
         title = clean_title(line)
         if title != "Tanpa Judul":
-            candidates.append((_score_title(title, idx), title))
+            score = _score_title(title, idx)
+            # Bonus untuk lines yang match CAPS pattern (biasanya official title)
+            if line.isupper() and len(line) > 10:
+                score += 30
+            candidates.append((score, title))
 
     if candidates:
-        return max(candidates)[1]
+        # Return highest scored title
+        best = max(candidates)[1]
+        # Avoid returning obvious non-titles
+        if best and best not in {"Tanpa Judul", "Hello Everyone"}:
+            return best
 
+    # Fallback: return first substantial non-noise line
     for line in lines:
         if not _is_noise_title(line):
             title = clean_title(line)
-            if title != "Tanpa Judul":
+            if title != "Tanpa Judul" and len(title) > 5:
                 return title
+    
     return "Tanpa Judul"
 
 
 # ---------------------------------------------------------------------------
-# Link extraction (IMPROVED)
+# Link extraction (REFACTORED)
 # ---------------------------------------------------------------------------
 
 def extract_urls_from_text(text: str) -> list[str]:
+    """Extract semua URLs dari text"""
     seen, result = set(), []
     for m in URL_RE.finditer(text or ""):
         url = clean_url(m.group(0))
@@ -433,16 +478,28 @@ def extract_urls_from_text(text: str) -> list[str]:
 
 def extract_registration_links(text: str = "", anchors: list[dict] | None = None) -> list[str]:
     """
-    Extract registration links dengan strategi berlapis:
-    1. Anchor links dengan registration context
-    2. Text-based dengan context window
-    3. Form hosts (forms.gle, bit.ly, etc)
-    4. Fallback: semua non-social URLs dari text
+    REFACTORED: Extract registration links dengan prioritas lebih jelas:
+    1. Form hosts (bit.ly, forms.gle, etc) - PRIMARY
+    2. Anchor links dengan registration context - SECONDARY
+    3. Text URLs dengan registration context - TERTIARY
     """
     anchors = anchors or []
     found: list[str] = []
     seen = set()
 
+    # Strategy 1: Extract form hosts (highest priority)
+    all_text_urls = extract_urls_from_text(text)
+    all_anchor_urls = [row.get("url", "") for row in anchors if row.get("url")]
+    
+    for raw_url in all_text_urls + all_anchor_urls:
+        url = clean_url(raw_url)
+        if url and url not in seen and not is_low_value_url(url):
+            netloc = urlparse(url).netloc.lower()
+            if any(host in netloc for host in FORM_HOSTS):
+                found.append(url)
+                seen.add(url)
+
+    # Strategy 2: Anchor links dengan registration context
     for row in anchors:
         url = clean_url(row.get("url", ""))
         if not url or url in seen or is_low_value_url(url):
@@ -453,6 +510,7 @@ def extract_registration_links(text: str = "", anchors: list[dict] | None = None
             found.append(url)
             seen.add(url)
 
+    # Strategy 3: Text URLs dalam registration context
     lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
     for idx, line in enumerate(lines):
         urls = extract_urls_from_text(line)
@@ -466,27 +524,6 @@ def extract_registration_links(text: str = "", anchors: list[dict] | None = None
                 if url not in seen:
                     found.append(url)
                     seen.add(url)
-
-    if not found:
-        all_anchors = [row["url"] for row in anchors if row.get("url")]
-        all_text_urls = extract_urls_from_text(text)
-        all_urls = all_anchors + all_text_urls
-        
-        for raw_url in all_urls:
-            url = clean_url(raw_url)
-            if url and url not in seen and not is_low_value_url(url):
-                netloc = urlparse(url).netloc.lower()
-                if any(host in netloc for host in FORM_HOSTS):
-                    found.append(url)
-                    seen.add(url)
-
-    if not found:
-        all_urls = extract_urls_from_text(text) + [row["url"] for row in anchors if row.get("url")]
-        for raw_url in all_urls:
-            url = clean_url(raw_url)
-            if url and url not in seen and not is_low_value_url(url):
-                found.append(url)
-                seen.add(url)
 
     return list(dict.fromkeys(found))
 
@@ -548,7 +585,7 @@ _LLM_PROMPT_PREFIX = (
     "Field judul harus berupa nama lomba/program/event saja, tanpa emoji, sapaan, label "
     "pendaftaran, tanggal, atau URL. "
     "Field deadline adalah timeline gabungan dari tanggal awal sampai akhir "
-    "(cth: '23-28 Januari' atau '23 Januari - 28 Februari'), kosongkan jika tidak ada. "
+    "(cth: '23-28 Januari 2026' atau '23 Januari - 28 Februari 2026'), kosongkan jika tidak ada. "
     "Field kategori adalah kategori lomba "
     "(IT/Bisnis/Webdev/Design/Poster/Data/Mobile/Game/Multimedia/IoT/Robotics/Lainnya). "
     "Field penyelenggara adalah nama organisasi atau institusi penyelenggara (kosongkan jika tidak ada). "
@@ -565,7 +602,7 @@ def process_batch_with_openrouter(batch: list) -> list:
     if not batch:
         return batch
 
-    # Pre-extract timeline dan kategori dari text untuk reference
+    # Pre-extract timeline dan kategori dari text
     for item in batch:
         caption = item.get("caption", "")
         if not item.get("deadline"):
@@ -633,7 +670,7 @@ def _build_item(uid, source, title, poster, caption, links, direct_url) -> dict:
         "kategori": extract_kategori(caption, title),
         "link_direct": direct_url,
         "link_pendaftaran": links,
-        "penyelenggara": "",  # Diisi oleh LLM
+        "penyelenggara": "",  # Diisi oleh LLM atau parsing manual
         "poster": poster,
         "sumber": source,
     }
